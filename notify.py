@@ -47,17 +47,20 @@ _API = "https://api.telegram.org/bot{token}/{method}"
 
 
 def _tg_post(token: str, method: str, payload: dict) -> bool:
-    """POST к Telegram Bot API. Возвращает True при успехе."""
+    """POST к Telegram Bot API через curl (обходит SSL-проблемы urllib)."""
     url = _API.format(token=token, method=method)
-    data = json.dumps(payload).encode("utf-8")
-    req = request.Request(
-        url, data=data, headers={"Content-Type": "application/json"}
-    )
     try:
-        with request.urlopen(req, timeout=15) as resp:
-            result = json.loads(resp.read())
-            return result.get("ok", False)
-    except error.URLError as exc:
+        result = subprocess.run(
+            [
+                "curl", "-s", "-X", "POST", url,
+                "-H", "Content-Type: application/json",
+                "-d", json.dumps(payload, ensure_ascii=False),
+            ],
+            capture_output=True, timeout=15,
+        )
+        resp = json.loads(result.stdout)
+        return resp.get("ok", False)
+    except Exception as exc:
         print(f"[notify] Telegram API error: {exc}", file=sys.stderr)
         return False
 
