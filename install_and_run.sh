@@ -81,34 +81,34 @@ if [ ! -f .env ]; then
 fi
 
 # ─────────────────────────────────────────────────────────────
-# 5. Telegram уведомления (опционально)
+# 5. Telegram уведомления
+#    Если TG_TOKEN и TG_CHAT_ID переданы через окружение — используем.
+#    Иначе спрашиваем (можно пропустить Enter'ом).
 # ─────────────────────────────────────────────────────────────
 
-echo ""
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "  📱 Настройка Telegram-уведомлений (необязательно)"
-echo "     Когда run закончится — отчёт придёт прямо в Telegram."
-echo ""
-echo "  Как получить токен:"
-echo "  1. Открыть @BotFather в Telegram → /newbot → скопировать токен"
-echo "  2. Написать боту /start"
-echo "  3. Узнать Chat ID: https://api.telegram.org/bot<ТОКЕН>/getUpdates"
-echo "     (в ответе найти \"id\" внутри \"chat\")"
-echo ""
-echo "  Чтобы пропустить — нажать Enter"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-
-read -p "  Telegram Bot Token: " TG_TOKEN
-if [ -n "$TG_TOKEN" ]; then
-    read -p "  Telegram Chat ID:   " TG_CHAT_ID
-    # Удалить старые записи и добавить новые
+if [ -n "$TG_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
     grep -v "TELEGRAM_BOT_TOKEN\|TELEGRAM_CHAT_ID" .env > .env.tmp 2>/dev/null || true
     mv .env.tmp .env
     echo "TELEGRAM_BOT_TOKEN=$TG_TOKEN" >> .env
     echo "TELEGRAM_CHAT_ID=$TG_CHAT_ID" >> .env
-    echo "[OK] Telegram настроен — отчёт придёт когда run завершится"
+    echo "[OK] Telegram настроен — отчёт придёт по окончании run"
 else
-    echo "[--] Telegram пропущен"
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "  📱 Telegram-уведомления (необязательно)"
+    echo "     Чтобы пропустить — нажать Enter"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    read -p "  Telegram Bot Token: " TG_TOKEN
+    if [ -n "$TG_TOKEN" ]; then
+        read -p "  Telegram Chat ID:   " TG_CHAT_ID
+        grep -v "TELEGRAM_BOT_TOKEN\|TELEGRAM_CHAT_ID" .env > .env.tmp 2>/dev/null || true
+        mv .env.tmp .env
+        echo "TELEGRAM_BOT_TOKEN=$TG_TOKEN" >> .env
+        echo "TELEGRAM_CHAT_ID=$TG_CHAT_ID" >> .env
+        echo "[OK] Telegram настроен"
+    else
+        echo "[--] Telegram пропущен"
+    fi
 fi
 
 # ─────────────────────────────────────────────────────────────
