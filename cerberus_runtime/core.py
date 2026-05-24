@@ -5,17 +5,19 @@ All arithmetic uses ``Decimal``.  There are deliberately **no** ``float``
 values in this module — any float that enters via external types is rejected
 by the type system before it can corrupt a calculation.
 
-Domain types (PriceLevel, LegQuote, OrderBookSnapshot, ArbitrageSignal) live
-in ``cerberus_runtime.models`` — the canonical home for all dataclasses.
-``AppConfig`` is kept here because it is specific to the evaluator contract.
+Domain types live in ``cerberus_runtime.models``.
+``AppConfig`` is the unified config from ``cerberus_runtime.config``.
 """
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
 from decimal import ROUND_DOWN, Decimal
 from typing import List, Optional
 
+# AppConfig is the single canonical class — defined in config.py.
+# Imported here so existing callers of ``from cerberus_runtime.core import AppConfig``
+# continue to work without modification.
+from cerberus_runtime.config import AppConfig  # noqa: F401
 from cerberus_runtime.fee_model import FeeModel
 from cerberus_runtime.models import (
     ArbitrageResult,
@@ -27,42 +29,6 @@ from cerberus_runtime.models import (
 )
 
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Evaluator configuration  (local to core — not a shared domain type)
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class AppConfig:
-    """Trading parameters consumed by the core opportunity evaluator.
-
-    All monetary/percentage fields are ``Decimal`` to maintain precision
-    throughout the calculation chain.
-
-    Attributes:
-        trade_notional_usdc:    Maximum USDC to deploy per leg.
-        slippage_buffer_pct:    Fraction reserved for slippage uncertainty.
-        legged_risk_buffer_pct: Fraction reserved for leg-execution timing risk.
-        min_net_edge_usd:       Minimum acceptable net edge in USDC.
-        min_net_edge_pct:       Minimum acceptable net edge as a fraction of
-                                total deployed capital (2 × notional).
-        min_order_size:         Minimum order value in USDC; levels below this
-                                are skipped during the depth walk.
-        tick_size:              Minimum price increment; order USDC amounts are
-                                rounded down to this granularity.
-        fee_params:             Per-market fee configuration (may be ``None``).
-    """
-
-    trade_notional_usdc: Decimal
-    slippage_buffer_pct: Decimal
-    legged_risk_buffer_pct: Decimal
-    min_net_edge_usd: Decimal
-    min_net_edge_pct: Decimal
-    min_order_size: Decimal
-    tick_size: Decimal
-    fee_params: Optional[FeeParams] = None
 
 
 # ---------------------------------------------------------------------------

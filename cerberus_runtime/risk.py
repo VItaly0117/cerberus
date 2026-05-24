@@ -12,11 +12,14 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import Enum
 from typing import Optional
 
+# AppConfig is the single canonical class — defined in config.py.
+# Imported here so existing callers of ``from cerberus_runtime.risk import AppConfig``
+# continue to work without modification.
+from cerberus_runtime.config import AppConfig  # noqa: F401
 from cerberus_runtime.models import OrderBookSnapshot
 
 logger = logging.getLogger(__name__)
@@ -51,46 +54,6 @@ class ArbitrageResult(Enum):
 
     STALE_BOOK = "STALE_BOOK"
     """Execution aborted because the order-book snapshot was stale."""
-
-
-# ---------------------------------------------------------------------------
-# AppConfig — risk-specific runtime configuration
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class AppConfig:
-    """Risk-related runtime configuration for the RiskManager.
-
-    Attributes:
-        dry_run_mode:            When True, paper-trading rules apply and live
-                                 execution is bypassed.  Mutually-independent
-                                 of ``allow_live_mode``.
-        allow_live_mode:         Must be explicitly set to True to permit live
-                                 order placement.  Provides a second-factor
-                                 safety gate on top of ``dry_run_mode``.
-        max_book_age_ms:         Maximum acceptable age for an order-book
-                                 snapshot in milliseconds before the
-                                 RiskManager considers it stale.
-        max_open_markets:        Maximum number of ``condition_id``\\ s that may
-                                 have open / in-flight positions simultaneously.
-        max_attempts_per_hour:   Rolling hourly cap on execution attempts
-                                 (resets on hour boundary of ``monotonic()``).
-        daily_loss_limit_usd:    Cumulative realised-loss threshold that
-                                 permanently latches the kill switch for the
-                                 current session (Decimal USDC).
-        market_cooldown_seconds: Minimum quiet period between two consecutive
-                                 attempts on the same market after a result
-                                 is recorded (seconds, wall-monotonic).
-    """
-
-    dry_run_mode: bool = True
-    allow_live_mode: bool = False
-    max_book_age_ms: int = 5_000
-    max_open_markets: int = 1
-    max_attempts_per_hour: int = 60
-    daily_loss_limit_usd: Decimal = field(default_factory=lambda: Decimal("50.00"))
-    market_cooldown_seconds: float = 10.0
 
 
 # ---------------------------------------------------------------------------
