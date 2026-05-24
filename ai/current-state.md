@@ -1,73 +1,87 @@
 # Cerberus — Current State
 
-## Status: Sprint 1 COMPLETE ✅
+## Status: Sprint 2 COMPLETE ✅
 **Date merged:** 2026-05-24
 
 ---
 
-## Sprint 1 — All branches merged to main
+## Sprint 2 — All branches merged to main
 
 ### Merge order
-1. `sprint1/tests-infra` → main  (no conflicts)
-2. `sprint1/fee-model-core` → main  (no conflicts — pre-merge fix applied)
-3. `sprint1/market-discovery` → main  (no conflicts)
-4. `sprint1/watcher-orderbook` → main  (conflict resolved — see below)
+1. `sprint2/risk-manager` → main  (no conflicts)
+2. `sprint2/executor` → main  (no conflicts)
+3. `sprint2/watcher-ws-loop` → main  (no conflicts — watcher.py fully replaced stub)
 
-### Pre-merge fix (fee-model-core)
-- Created canonical `cerberus_runtime/models.py` consolidating Agent B and Agent C types.
-- Removed duplicate dataclass definitions from `core.py`; replaced with imports from models.
-- `setup.cfg` updated with `pythonpath = .` so `pytest` works without env-var prefix.
-
-### Conflict resolution (watcher-orderbook)
-- `cerberus_runtime/models.py`: kept HEAD (Decimal-canonical). Agent B's float-based
-  `PriceLevel` superseded; extended fields (condition_id, ts_ms, book_hash, etc.)
-  preserved as optional fields on `OrderBookSnapshot`.
-- `cerberus_runtime/orderbook.py`: _parse_levels and _apply_changes updated to
-  produce PriceLevel with Decimal fields; get_snapshot() received required
-  timestamp field (converted from ts_ms / 1000.0).
-- `requirements.txt`: merged both sets (websockets, aiohttp added from Agent B).
-- `tests/test_orderbook.py`: hash helpers and assertions updated for Decimal.
-
----
-
-## Files added in Sprint 1
-
-### cerberus_runtime/
+### Files added in Sprint 2
 | File | Owner | Description |
 |------|-------|-------------|
-| models.py | Canonical (B+C) | All shared dataclasses: PriceLevel, FeeParams, OrderBookSnapshot, LegQuote, ArbitrageSignal, ArbitrageResult, Market |
-| core.py | Agent C | Depth-walk engine and opportunity evaluator (Decimal-only) |
-| fee_model.py | Agent C | Taker-fee calculator sourced from live FeeParams |
-| market_discovery.py | Agent A | Async Gamma API market scanner with back-off |
-| orderbook.py | Agent B | LocalOrderBook - L2 state machine for YES/NO legs |
-| watcher.py | Agent B | WebSocket event dispatcher (stub, connects orderbook) |
-
-### tests/ — 68 passed, 1 skipped
-| File | Tests | Focus |
-|------|-------|-------|
-| test_fee_model.py | 12 | FeeModel calculate_fee + fallback |
-| test_core_opportunity.py | 12 | Depth walk + evaluate_opportunity |
-| test_market_discovery.py | 24 | Filter, backoff, scan behavior |
-| test_orderbook.py | 12 | LocalOrderBook event handling + hashing |
-| test_config.py | 2 | AppConfig defaults |
-| test_storage.py | 4 | SQLite storage lifecycle |
-| test_integration_paper.py | 2+1skip | Paper-trading dry-run |
+| cerberus_runtime/risk.py | Agent A | RiskManager: kill switch, cooldowns, daily loss limit, hourly cap, live-mode gate |
+| cerberus_runtime/executor.py | Agent B | Sequential FOK/FAK executor, emergency repair, dry-run simulation |
+| cerberus_runtime/watcher.py | Agent C | Full WebSocket loop: subscribe, reconnect back-off, resync, snapshot emission |
 
 ---
 
-## Invariants verified post-merge
-- PASS: cerberus_runtime/ does not import from cerberus_runtime.core
-- PASS: No hardcoded fee constants in fee_model.py
-- PASS: No float() calls in core.py or fee_model.py
-- PASS: 68 tests pass; 1 skipped (live WebSocket integration placeholder)
+## Safety checks (post Sprint 2 merge)
+- PASS: No asyncio.gather() call in executor.py (prohibition note in docstring only)
+- PASS: No float() calls in risk.py or executor.py
+- PASS: allow_live_mode guard present in executor.py (line 164 comment + risk.py gate)
+- PASS: Executor import OK (`Executor.__new__(Executor)`)
+- PASS: 98 tests pass, 1 skipped
 
 ---
 
-## Known gaps / Sprint 2 targets
-- watcher.py: WebSocket connection and event-dispatch loop not yet implemented
-- risk.py: position-size and exposure limits not yet built
-- executor.py: order placement against CLOB API not yet built
-- ArbitrageResult is currently an alias for ArbitrageSignal; Sprint 2 will extend
-  with execution metadata (fill prices, actual fees, slippage realised)
-- No end-to-end integration test with live or mock WebSocket feed
-- CI workflow (.github/workflows/cerberus-ci.yml) present but not yet triggered
+## Full test count: 98 passed, 1 skipped
+
+| Test file | Tests | Sprint |
+|-----------|-------|--------|
+| test_fee_model.py | 12 | 1 |
+| test_core_opportunity.py | 12 | 1 |
+| test_market_discovery.py | 24 | 1 |
+| test_orderbook.py | 12 | 1 |
+| test_config.py | 2 | 1 |
+| test_storage.py | 4 | 1 |
+| test_integration_paper.py | 2+1skip | 1 |
+| test_risk_manager.py | 10 | 2 |
+| test_executor.py | 10 | 2 |
+| test_watcher_loop.py | 10 | 2 |
+
+---
+
+## Invariants verified
+- No asyncio.gather() in executor.py (sequential legs guaranteed)
+- No float() in risk.py or executor.py (Decimal-only arithmetic)
+- allow_live_mode guard in executor comment + enforced by RiskManager
+- No live CLOB API calls in dry_run_mode (RuntimeError guard in _send_order)
+
+---
+
+## Sprint 3 targets — Paper 72h run
+
+### Goal
+Run `cerberustest.py --paper` for 72 hours in a sandboxed environment
+against Polymarket's live WebSocket feed (no real orders placed).
+
+### What Sprint 3 needs
+1. **cerberustest.py** — CLI entry point that wires all Sprint 1+2 components:
+   - Initialise: Config, Storage, MarketDiscovery, Watcher, RiskManager, Executor
+   - candidate_queue → MarketDiscovery → Watcher → opportunity_queue
+   - opportunity_queue → core.evaluate_opportunity → RiskManager.allows → Executor.execute_pair (dry_run=True)
+   - --paper flag: forces dry_run_mode=True, allow_live_mode=False
+   - Logs every SIGNAL, BLOCKED, MISS, SUCCESS, LEGGED event with timestamps
+
+2. **Paper-run reporting** — after 72 h, emit JSON summary:
+   - total_signals_seen, total_attempts, success_rate
+   - edge_gross_usdc (sum), fees_usdc (sum), net_edge_usdc (sum)
+   - legged_events (count + avg loss)
+   - top_markets by signal frequency
+
+3. **Sprint 3 branches** (TBD):
+   - sprint3/cerberustest-entry — cerberustest.py + CLI wiring
+   - sprint3/paper-reporter — JSON/Markdown summary generator
+   - sprint3/72h-paper-run — integration test + paper run results
+
+### Known gaps before paper run
+- cerberustest.py does not yet exist
+- Storage schema needs INSERT for paper-run signals table
+- Config dataclass needs clob_rest_url, ws_url, dry_run_mode fields unified
+- RiskManager.AppConfig and core.AppConfig are separate (acceptable for Sprint 3)
