@@ -1,136 +1,240 @@
-# Cerberus — Polymarket Arbitrage Paper Trader
+# 🐺 Cerberus — Polymarket Paper Trader
 
-Cerberus is a dry-run / paper-trading engine that monitors [Polymarket](https://polymarket.com)
-binary-outcome markets for YES/NO arbitrage opportunities and simulates execution.
-**No real orders are ever placed.** The `--paper` flag is permanently enforced in
-`dry_run_mode=True`.
+Cerberus автоматически мониторит рынки [Polymarket](https://polymarket.com) и ищет арбитраж между ценами YES и NO токенов одного и того же события. Все сделки **симулируются** — реальные деньги не тратятся. По окончании прогона присылает отчёт в **Telegram**.
+
+> **Принцип**: цена YES + цена NO должна быть = 1.00 USDC. Если сумма < 0.97 — можно купить оба токена и зафиксировать прибыль. Cerberus ловит такие моменты.
 
 ---
 
-## Quick start
+## ⚡ Запустить одной командой
+
+### Linux (Ubuntu / Debian / Raspberry Pi)
+```bash
+curl -fsSL https://raw.githubusercontent.com/VItaly0117/cerberus/main/install_and_run.sh | bash
+```
+
+### Android (Termux)
+```bash
+pkg install curl -y
+curl -fsSL https://raw.githubusercontent.com/VItaly0117/cerberus/main/install_and_run.sh | bash
+```
+
+Скрипт сам установит Python, зависимости, запустит в фоне через `screen` и настроит Telegram-уведомление.
+
+---
+
+## 📱 Настройка Telegram-уведомлений
+
+Когда 72-часовой прогон закончится, Cerberus пришлёт отчёт прямо в Telegram. Настройка занимает 2 минуты:
+
+### Шаг 1 — Создать бота
+1. Открыть [@BotFather](https://t.me/BotFather) в Telegram
+2. Написать `/newbot`
+3. Придумать имя и username для бота
+4. Скопировать **токен** — выглядит так: `7412345678:AAFxyz...`
+
+### Шаг 2 — Узнать свой Chat ID
+1. Написать боту любое сообщение (например `/start`)
+2. Открыть в браузере (вставить свой токен):
+   ```
+   https://api.telegram.org/bot<ТВОЙ_ТОКЕН>/getUpdates
+   ```
+3. В ответе найти `"chat":{"id":123456789}` — это твой **Chat ID**
+
+### Шаг 3 — Добавить в `.env`
+```bash
+# В папке проекта:
+echo "TELEGRAM_BOT_TOKEN=7412345678:AAFxyz..." >> .env
+echo "TELEGRAM_CHAT_ID=123456789" >> .env
+```
+
+> 💡 Скрипт `install_and_run.sh` спросит токен и chat_id сам — можно ввести прямо во время установки.
+
+### Что придёт в Telegram
+
+```
+🐺 Cerberus Paper Run — Завершён
+━━━━━━━━━━━━━━━━━━
+⏱ Время: 72.0ч
+📊 Снапшотов оценено: 48 320
+📡 Viable сигналов: 41
+✅ Успешных: 27
+💨 Clean miss: 12
+⚡ Legged risk: 2
+🚫 Заблокировано: 1 840
+━━━━━━━━━━━━━━━━━━
+🟢 Simulated P&L: +8.4700 USDC
+📈 Медиана edge: 2.31%
+📚 Stale книга: 1.8%
+━━━━━━━━━━━━━━━━━━
+✅ Stop conditions: нет
+
+🏆 Вердикт: Стратегия работает — запускать live
+```
+
+---
+
+## 📊 Как читать результаты
+
+### Ключевые метрики
+
+| Метрика | Что означает | Хорошо | Плохо |
+|---------|-------------|--------|-------|
+| `viable_signals` | Сколько раз нашёлся арбитраж | > 30 за 72ч | < 5 за 72ч |
+| `median_edge_net_pct` | Медианный чистый профит | > 2% | ≤ 0% |
+| `total_simulated_pnl` | Итоговый P&L в USDC | > $5 | < 0 |
+| `legged_incident_rate_pct` | % сделок где 2-я нога не купилась | < 5% | > 15% |
+| `stale_book_rate_pct` | % устаревших данных книги | < 5% | > 10% |
+| `successes / viable` | Процент успешных сделок | > 60% | < 40% |
+
+### Три сценария
+
+**✅ Стратегия работает**
+- viable_signals > 30 за 72ч
+- median_edge > 2%
+- P&L > $5 на $25 нотионал (= >7% за 3 дня)
+
+→ Запускать live с реальным капиталом $100–500.
+
+**⚠️ Работает слабо**
+- viable_signals 5–30
+- median_edge 1–2%
+- P&L около нуля
+
+→ Оптимизировать параметры или искать нишевые рынки.
+
+**❌ Не работает**
+- viable_signals < 5 за 72ч
+- median_edge ≤ 0
+
+→ Рынок эффективен в этом сегменте — менять стратегию.
+
+### Как вытащить подробные данные из базы
 
 ```bash
-# Install dependencies
-pip install -r requirements.txt
+cd ~/project-cerberus
 
-# Check all systems are go
-python3 cerberustest.py --preflight
+# Топ рынков по сигналам
+sqlite3 cerberus.db "
+SELECT market_id, COUNT(*) as n, ROUND(AVG(edge_net_pct)*100,2) as avg_edge_pct
+FROM paper_signals WHERE result='SUCCESS'
+GROUP BY market_id ORDER BY n DESC LIMIT 10;"
 
-# Paper-trade for up to 5 signals (stop early for dev testing)
-python3 cerberustest.py --paper --max-signals 5
+# P&L по дням
+sqlite3 cerberus.db "
+SELECT DATE(recorded_at) as day, SUM(simulated_pnl) as daily_pnl, COUNT(*) as trades
+FROM paper_signals WHERE result='SUCCESS'
+GROUP BY day;"
 
-# Full 72-hour paper run
-python3 cerberustest.py --paper --duration-hours 72
+# Распределение edge (гистограмма)
+sqlite3 cerberus.db "
+SELECT ROUND(edge_net_pct*100,1) as edge_pct, COUNT(*) as count
+FROM paper_signals WHERE edge_net_pct IS NOT NULL
+GROUP BY edge_pct ORDER BY edge_pct;"
 ```
 
 ---
 
-## Architecture
+## ⚙️ Конфигурация
+
+Все параметры задаются через переменные окружения в `.env`:
+
+| Переменная | По умолчанию | Описание |
+|------------|-------------|----------|
+| `TRADE_NOTIONAL_USDC` | `25` | Размер ставки на каждую пару (USDC) |
+| `MIN_NET_EDGE_PCT` | `0.0125` | Минимальный чистый edge для входа (1.25%) |
+| `DB_PATH` | `cerberus.db` | Путь к базе данных |
+| `GAMMA_HOST` | `gamma-api.polymarket.com` | API для списка рынков |
+| `CLOB_REST_URL` | `https://clob.polymarket.com` | REST API ордербука |
+| `WS_URL` | `wss://ws-subscriptions-clob.polymarket.com/ws/market` | WebSocket поток |
+| `ALLOW_LIVE_MODE` | `false` | ⛔ Всегда `false` — реальные сделки не поддерживаются |
+| `TELEGRAM_BOT_TOKEN` | — | Токен Telegram-бота для уведомлений |
+| `TELEGRAM_CHAT_ID` | — | Ваш Telegram Chat ID |
+
+---
+
+## 🔍 Как работает изнутри
 
 ```
-MarketDiscovery → candidate_queue → Watcher → opportunity_queue → Core → Risk → Executor
+Polymarket Gamma API
+        │
+        ▼
+  MarketDiscovery          ← сканирует список рынков каждые 5 минут
+  (market_discovery.py)       фильтрует: объём, дата, бинарность
+        │
+        ▼ candidate_queue
+      Watcher              ← подписывается на WebSocket ордербуков
+   (watcher.py)               обновляет L2 книгу в реальном времени
+        │
+        ▼ opportunity_queue
+      RiskManager          ← проверяет: kill switch, cooldown, лимиты
+    (risk.py)
+        │ (разрешено)
+        ▼
+        Core               ← считает edge = 1 - YES_ask - NO_ask - fees - slippage
+      (core.py)
+        │ (edge > порога)
+        ▼
+      Executor             ← симулирует FOK на YES, потом FOK на NO
+   (executor.py)              при неудаче — аварийный откат
+        │
+        ▼
+      Storage              ← записывает каждый сигнал в SQLite
+   (storage.py)
+        │
+        ▼
+    notify.py              ← по окончании → отчёт в Telegram
 ```
 
-| Component | Module | Description |
-|-----------|--------|-------------|
-| MarketDiscovery | `cerberus_runtime/market_discovery.py` | Polls Gamma API, emits new markets |
-| Watcher | `cerberus_runtime/watcher.py` | WebSocket order-book subscriber, snapshot emitter |
-| Core | `cerberus_runtime/core.py` | Depth-walk evaluator, edge calculation |
-| RiskManager | `cerberus_runtime/risk.py` | Kill switch, daily loss limit, cooldowns, hourly cap |
-| Executor | `cerberus_runtime/executor.py` | Sequential FOK/FAK simulator (dry-run only) |
-| Storage | `cerberus_runtime/storage.py` | Async SQLite via `aiosqlite` |
+### Почему нет реальных сделок
+
+В текущей версии `allow_live_mode = False` **принудительно** — это не настройка, а защитный код. Если кто-то поставит `ALLOW_LIVE_MODE=true`, скрипт завершится с ошибкой (`exit 1`). Реальный live-режим требует отдельного аудита и интеграции с CLOB API.
 
 ---
 
-## Safety invariants
-
-| Invariant | Where enforced |
-|-----------|----------------|
-| `dry_run_mode = True` always in `--paper` | `cerberustest.py:404` |
-| `allow_live_mode = False` in `--paper`; abort if env overrides | `cerberustest.py:386-391` |
-| Order legs execute **sequentially** (no `asyncio.gather`) | `executor.py` design rule |
-| All arithmetic uses `Decimal` (no `float` in core math) | `core.py`, `fee_model.py`, `risk.py` |
-| `PRIVATE_KEY` only in `config.py` / `preflight.py` | grep check in CI |
-| Kill switch latches permanently (never resets without restart) | `risk.py:RiskManager` |
-
----
-
-## Configuration (environment variables)
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `GAMMA_HOST` | `gamma-api.polymarket.com` | Gamma API hostname |
-| `CLOB_REST_URL` | `https://clob.polymarket.com` | CLOB REST endpoint |
-| `WS_URL` | `wss://ws-subscriptions-clob.polymarket.com/ws/market` | WebSocket endpoint |
-| `TRADE_NOTIONAL_USDC` | `25` | Per-leg notional in USDC |
-| `MIN_NET_EDGE_PCT` | `0.0125` | Minimum net edge as fraction of notional |
-| `DB_PATH` | `cerberus.db` | SQLite database file path |
-| `ALLOW_LIVE_MODE` | `false` | **Must be `false` for paper runs; abort if `true`** |
-
----
-
-## Running tests
+## 🧪 Тесты
 
 ```bash
+cd ~/project-cerberus
+source .venv/bin/activate
 pytest tests/ -v --tb=short
-# Expected: 106 passed, 1 skipped
+# Ожидается: 106 passed, 1 skipped
 ```
 
-| Test file | Count | Sprint |
-|-----------|-------|--------|
-| test_fee_model.py | 12 | 1 |
-| test_core_opportunity.py | 12 | 1 |
-| test_market_discovery.py | 24 | 1 |
-| test_orderbook.py | 12 | 1 |
-| test_config.py | 2 | 1 |
-| test_storage.py | 5 | 1+3 |
-| test_integration_paper.py | 2+1skip | 1 |
-| test_risk_manager.py | 10 | 2 |
-| test_executor.py | 10 | 2 |
-| test_watcher_loop.py | 10 | 2 |
-| test_paper_run.py | 7 | 3 |
-
 ---
 
-## Paper run report
+## 🔧 Наблюдать за процессом
 
-After each run, a JSON report is saved to `artifacts/paper/report_{timestamp}.json`:
+```bash
+# Подключиться к фоновой сессии
+screen -r cerberus
 
-```json
-{
-  "run_duration_hours": 1.0,
-  "config": { "trade_notional_usdc": "25", ... },
-  "results": {
-    "total_snapshots_evaluated": 500,
-    "viable_signals": 12,
-    "successes": 8,
-    "legged_incidents": 1,
-    "total_simulated_pnl": "3.7500",
-    "median_edge_net_pct": "0.0215"
-  },
-  "gate_status": {
-    "stale_book_rate_pct": 2.4,
-    "legged_incident_rate_pct": 8.3,
-    "median_edge_positive": true
-  },
-  "stop_conditions_triggered": []
-}
+# Только лог (не подключаясь к screen)
+tail -f ~/project-cerberus/artifacts/paper/run.log
+
+# Отключиться от screen без остановки
+# Ctrl+A, затем D
+
+# Посмотреть текущую статистику
+sqlite3 ~/project-cerberus/cerberus.db "
+SELECT result, COUNT(*) FROM paper_signals GROUP BY result;"
 ```
 
-Exit codes: `0` = median edge positive, `1` = safety abort, `2` = median edge ≤ 0.
-
 ---
 
-## Sprint history
+## ❓ FAQ
 
-| Sprint | Branches | Status |
-|--------|----------|--------|
-| Sprint 1 | market-discovery, watcher-orderbook, fee-model-core, tests-infra | ✅ merged |
-| Sprint 2 | risk-manager, executor, watcher-ws-loop | ✅ merged |
-| Sprint 3 | paper-run | ✅ ready to merge |
+**Q: Нужны ли реальные деньги или аккаунт Polymarket?**
+A: Нет. Cerberus читает публичные данные без авторизации. Никаких аккаунтов, никаких ключей API.
 
----
+**Q: Что такое "legged risk"?**
+A: Когда купился YES-токен, но NO-токен не успели купить (цена ушла). В этот момент позиция незакрыта и есть риск убытка. Executor сразу же продаёт YES обратно по рынку чтобы ограничить потери.
 
-## GitHub
+**Q: Почему "FILTERED" записей много?**
+A: Cerberus оценивает каждый снапшот ордербука. Большинство не проходят по минимальному edge — это нормально. Важно соотношение viable_signals / total_snapshots.
 
-Repository: <https://github.com/VItaly0117/cerberus>
+**Q: Можно запустить на VPS или домашнем роутере?**
+A: Да. Любой Linux с Python 3.9+. На слабом железе (Raspberry Pi Zero) может быть задержка WebSocket — в этом случае увеличить `max_book_age_ms` в `.env`.
+
+**Q: Что делать если preflight падает на websockets?**
+A: `pip install websockets` внутри venv (`source .venv/bin/activate && pip install websockets`).
