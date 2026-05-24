@@ -1,1 +1,7 @@
 artifacts/paper/run.log
+.env
+.launch.sh
+__pycache__/
+*.pyc
+cerberus.db
+*.db
