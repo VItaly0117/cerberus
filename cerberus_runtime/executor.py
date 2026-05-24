@@ -24,7 +24,8 @@ from decimal import Decimal
 from enum import Enum
 from typing import Dict, List, Literal, Optional
 
-from cerberus_runtime.core import AppConfig, calculate_effective_leg
+from cerberus_runtime.config import AppConfig
+from cerberus_runtime.core import calculate_effective_leg
 from cerberus_runtime.fee_model import FeeModel
 from cerberus_runtime.models import (
     ArbitrageSignal,
