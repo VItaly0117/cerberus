@@ -4,6 +4,10 @@ Core opportunity-evaluation engine for the Cerberus trading runtime.
 All arithmetic uses ``Decimal``.  There are deliberately **no** ``float``
 values in this module — any float that enters via external types is rejected
 by the type system before it can corrupt a calculation.
+
+Domain types (PriceLevel, LegQuote, OrderBookSnapshot, ArbitrageSignal) live
+in ``cerberus_runtime.models`` — the canonical home for all dataclasses.
+``AppConfig`` is kept here because it is specific to the evaluator contract.
 """
 from __future__ import annotations
 
@@ -13,63 +17,21 @@ from decimal import ROUND_DOWN, Decimal
 from typing import List, Optional
 
 from cerberus_runtime.fee_model import FeeModel
-from cerberus_runtime.models import FeeParams
+from cerberus_runtime.models import (
+    ArbitrageResult,
+    ArbitrageSignal,
+    FeeParams,
+    LegQuote,
+    OrderBookSnapshot,
+    PriceLevel,
+)
 
 logger = logging.getLogger(__name__)
 
+
 # ---------------------------------------------------------------------------
-# Domain types
+# Evaluator configuration  (local to core — not a shared domain type)
 # ---------------------------------------------------------------------------
-
-
-@dataclass
-class PriceLevel:
-    """A single resting level in a Polymarket CLOB order book.
-
-    Attributes:
-        price: Price in USDC per prediction-market token (0 < price < 1).
-        size:  Available token quantity at this price level.
-    """
-
-    price: Decimal
-    size: Decimal
-
-
-@dataclass
-class LegQuote:
-    """Aggregate fill result produced by a depth walk over one order-book side.
-
-    Attributes:
-        avg_price:          Volume-weighted average fill price (USDC / token).
-        coverage_pct:       Fraction of the requested notional that was filled
-                            (0 ≤ coverage_pct ≤ 1).
-        fee_usdc:           Fee in USDC for this leg.
-        accumulated_cost:   Total USDC spent walking the book.
-        accumulated_tokens: Total tokens acquired walking the book.
-    """
-
-    avg_price: Decimal
-    coverage_pct: Decimal
-    fee_usdc: Decimal
-    accumulated_cost: Decimal
-    accumulated_tokens: Decimal
-
-
-@dataclass
-class OrderBookSnapshot:
-    """Point-in-time order book snapshot for a single binary-outcome market.
-
-    Attributes:
-        market_id:  Exchange-assigned market identifier.
-        yes_asks:   Ask levels for the YES token, sorted cheapest-first.
-        no_asks:    Ask levels for the NO token, sorted cheapest-first.
-        timestamp:  Unix timestamp of the snapshot (seconds, wall-clock only).
-    """
-
-    market_id: str
-    yes_asks: List[PriceLevel]
-    no_asks: List[PriceLevel]
-    timestamp: float
 
 
 @dataclass
@@ -80,17 +42,17 @@ class AppConfig:
     throughout the calculation chain.
 
     Attributes:
-        trade_notional_usdc:   Maximum USDC to deploy per leg.
-        slippage_buffer_pct:   Fraction reserved for slippage uncertainty.
+        trade_notional_usdc:    Maximum USDC to deploy per leg.
+        slippage_buffer_pct:    Fraction reserved for slippage uncertainty.
         legged_risk_buffer_pct: Fraction reserved for leg-execution timing risk.
-        min_net_edge_usd:      Minimum acceptable net edge in USDC.
-        min_net_edge_pct:      Minimum acceptable net edge as a fraction of
-                               total deployed capital (2 × notional).
-        min_order_size:        Minimum order value in USDC; levels below this
-                               are skipped during the depth walk.
-        tick_size:             Minimum price increment; order USDC amounts are
-                               rounded down to this granularity.
-        fee_params:            Per-market fee configuration (may be ``None``).
+        min_net_edge_usd:       Minimum acceptable net edge in USDC.
+        min_net_edge_pct:       Minimum acceptable net edge as a fraction of
+                                total deployed capital (2 × notional).
+        min_order_size:         Minimum order value in USDC; levels below this
+                                are skipped during the depth walk.
+        tick_size:              Minimum price increment; order USDC amounts are
+                                rounded down to this granularity.
+        fee_params:             Per-market fee configuration (may be ``None``).
     """
 
     trade_notional_usdc: Decimal
@@ -101,33 +63,6 @@ class AppConfig:
     min_order_size: Decimal
     tick_size: Decimal
     fee_params: Optional[FeeParams] = None
-
-
-@dataclass
-class ArbitrageSignal:
-    """A confirmed arbitrage opportunity that cleared all risk thresholds.
-
-    Attributes:
-        market_id:           Exchange-assigned market identifier.
-        yes_quote:           Depth-walk result for the YES leg.
-        no_quote:            Depth-walk result for the NO leg.
-        edge_gross:          Raw profit before fees and risk reserve (USDC).
-        fees_total:          Combined fee for YES + NO legs (USDC).
-        risk_haircut:        Slippage + legged-risk reserve (USDC).
-        edge_net:            Profit after all deductions (USDC).
-        edge_net_pct:        Net edge as a fraction of total deployed capital.
-        trade_notional_usdc: Per-leg notional used to compute this signal (USDC).
-    """
-
-    market_id: str
-    yes_quote: LegQuote
-    no_quote: LegQuote
-    edge_gross: Decimal
-    fees_total: Decimal
-    risk_haircut: Decimal
-    edge_net: Decimal
-    edge_net_pct: Decimal
-    trade_notional_usdc: Decimal
 
 
 # ---------------------------------------------------------------------------
