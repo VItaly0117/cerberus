@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import time
+from decimal import Decimal
 
 import pytest
 
@@ -34,12 +35,18 @@ def _make_book_event(
     """
     Build a synthetic 'book' event dict with a correctly computed hash.
 
+    PriceLevel fields use Decimal (via Decimal(str(...))) to match the
+    canonical representation used by LocalOrderBook._parse_levels.
+
     Set *corrupt_hash=True* to deliberately provide the wrong hash so
     tests can verify that needs_resync is triggered.
     """
     levels = sorted(
-        [PriceLevel(price=float(a["price"]), size=float(a["size"]))
-         for a in asks if float(a["size"]) > 0],
+        [
+            PriceLevel(price=Decimal(str(a["price"])), size=Decimal(str(a["size"])))
+            for a in asks
+            if Decimal(str(a["size"])) > Decimal("0")
+        ],
         key=lambda pl: pl.price,
     )
     good_hash = _token_hash(levels)
@@ -63,20 +70,22 @@ def _make_price_change_event(
     Build a synthetic 'price_change' event dict.
 
     Applies *changes* to *current_yes_asks* locally so it can embed the
-    correct expected hash.  Set *corrupt_hash=True* to force mismatch.
+    correct expected hash.  Uses Decimal keys to match _apply_changes exactly.
+    Set *corrupt_hash=True* to force mismatch.
     """
-    # Replicate _apply_changes logic for building the expected post-delta hash.
-    book: dict[float, float] = {pl.price: pl.size for pl in current_yes_asks}
+    # Replicate _apply_changes logic using Decimal keys for hash consistency.
+    book: dict[str, Decimal] = {str(pl.price): pl.size for pl in current_yes_asks}
     sell_changes = [c for c in changes if c.get("side", "SELL").upper() in ("SELL", "ASK")]
     for ch in sell_changes:
-        price = float(ch["price"])
-        size = float(ch["size"])
-        if size == 0.0:
-            book.pop(price, None)
+        price_str = str(Decimal(str(ch["price"])))
+        size = Decimal(str(ch["size"]))
+        if size == Decimal("0"):
+            book.pop(price_str, None)
         else:
-            book[price] = size
+            book[price_str] = size
     updated = sorted(
-        [PriceLevel(p, s) for p, s in book.items()], key=lambda pl: pl.price
+        [PriceLevel(Decimal(p), s) for p, s in book.items()],
+        key=lambda pl: pl.price,
     )
     good_hash = _token_hash(updated)
     return {
@@ -142,15 +151,15 @@ def test_apply_book_snapshot_sets_asks(book: LocalOrderBook) -> None:
     assert len(book.yes_asks) == 2
     assert len(book.no_asks)  == 2
 
-    # Sorted by price ascending.
-    assert book.yes_asks[0].price == pytest.approx(0.60)
-    assert book.yes_asks[1].price == pytest.approx(0.65)
-    assert book.no_asks[0].price  == pytest.approx(0.35)
-    assert book.no_asks[1].price  == pytest.approx(0.40)
+    # Sorted by price ascending (Decimal comparisons).
+    assert book.yes_asks[0].price == Decimal("0.60")
+    assert book.yes_asks[1].price == Decimal("0.65")
+    assert book.no_asks[0].price  == Decimal("0.35")
+    assert book.no_asks[1].price  == Decimal("0.40")
 
     # Sizes preserved.
-    assert book.yes_asks[0].size == pytest.approx(100.0)
-    assert book.yes_asks[1].size == pytest.approx(200.0)
+    assert book.yes_asks[0].size == Decimal("100")
+    assert book.yes_asks[1].size == Decimal("200")
 
     # Hash was correct → no resync needed.
     assert not book.needs_resync
@@ -360,17 +369,17 @@ def test_apply_price_change_updates_level(book: LocalOrderBook) -> None:
     # Expected post-delta state: [0.60/100, 0.62/50].
     assert len(book.yes_asks) == 2
     prices = {pl.price for pl in book.yes_asks}
-    assert 0.60 in prices
-    assert 0.62 in prices
-    assert 0.65 not in prices
+    assert Decimal("0.60") in prices
+    assert Decimal("0.62") in prices
+    assert Decimal("0.65") not in prices
 
     # Size of the unchanged level is intact.
-    level_060 = next(pl for pl in book.yes_asks if pl.price == pytest.approx(0.60))
-    assert level_060.size == pytest.approx(100.0)
+    level_060 = next(pl for pl in book.yes_asks if pl.price == Decimal("0.60"))
+    assert level_060.size == Decimal("100")
 
     # Size of the new level is correct.
-    level_062 = next(pl for pl in book.yes_asks if pl.price == pytest.approx(0.62))
-    assert level_062.size == pytest.approx(50.0)
+    level_062 = next(pl for pl in book.yes_asks if pl.price == Decimal("0.62"))
+    assert level_062.size == Decimal("50")
 
 
 def test_apply_price_change_unknown_asset_is_noop(book: LocalOrderBook) -> None:
@@ -413,6 +422,6 @@ def test_apply_price_change_updates_existing_size(book: LocalOrderBook) -> None:
     book.apply_price_change(delta_event)
 
     assert len(book.yes_asks) == 1
-    assert book.yes_asks[0].price == pytest.approx(0.60)
-    assert book.yes_asks[0].size  == pytest.approx(250.0)
+    assert book.yes_asks[0].price == Decimal("0.60")
+    assert book.yes_asks[0].size  == Decimal("250")
     assert not book.needs_resync
