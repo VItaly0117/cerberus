@@ -12,7 +12,7 @@ from typing import Optional
 
 import aiosqlite
 
-from cerberus_runtime.models import ArbitrageSignal, FeeParams, Market
+from cerberus_runtime.models import ArbitrageSignal, FeeParams, Market, ResolutionSignal
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +50,32 @@ CREATE TABLE IF NOT EXISTS paper_signals (
     simulated_pnl    REAL NOT NULL DEFAULT 0.0,
     recorded_at      TEXT NOT NULL DEFAULT (datetime('now'))
 );
+"""
+
+_DDL_RESOLUTION = """
+CREATE TABLE IF NOT EXISTS resolution_signals (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    market_id     TEXT NOT NULL,
+    condition_id  TEXT NOT NULL DEFAULT '',
+    outcome       TEXT NOT NULL,
+    token_id      TEXT NOT NULL DEFAULT '',
+    current_ask   REAL NOT NULL,
+    edge_net_pct  REAL NOT NULL,
+    fee_usdc      REAL NOT NULL DEFAULT 0.0,
+    confidence    TEXT NOT NULL DEFAULT 'confirmed',
+    source        TEXT NOT NULL DEFAULT 'gamma_api',
+    simulated_pnl REAL NOT NULL DEFAULT 0.0,
+    ts_ms         INTEGER NOT NULL DEFAULT 0,
+    recorded_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+"""
+
+_INSERT_RESOLUTION_SIGNAL = """
+INSERT INTO resolution_signals (
+    market_id, condition_id, outcome, token_id,
+    current_ask, edge_net_pct, fee_usdc,
+    confidence, source, simulated_pnl, ts_ms
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 _UPSERT = """
@@ -109,6 +135,7 @@ class Storage:
         self._conn = await aiosqlite.connect(self.db_path)
         self._conn.row_factory = aiosqlite.Row
         await self._conn.executescript(_DDL)
+        await self._conn.executescript(_DDL_RESOLUTION)
         await self._conn.commit()
         logger.debug("Storage connected: %s", self.db_path)
 
@@ -352,6 +379,61 @@ class Storage:
     # ------------------------------------------------------------------
     # RiskManager storage interface
     # ------------------------------------------------------------------
+
+    async def insert_resolution_signal(
+        self,
+        signal: ResolutionSignal,
+        simulated_pnl: Decimal = Decimal("0"),
+    ) -> None:
+        """Record one resolution-arbitrage signal."""
+        assert self._conn, "Call connect() before insert_resolution_signal()"
+        await self._conn.execute(
+            _INSERT_RESOLUTION_SIGNAL,
+            (
+                signal.market_id,
+                signal.condition_id,
+                signal.outcome,
+                signal.token_id,
+                float(signal.current_ask),
+                float(signal.edge_net_pct),
+                float(signal.fee_usdc),
+                signal.confidence,
+                signal.source,
+                float(simulated_pnl),
+                signal.ts_ms,
+            ),
+        )
+        await self._conn.commit()
+
+    async def get_resolution_summary(self, since_ts_ms: int = 0) -> dict:
+        """Return aggregated resolution-arbitrage statistics."""
+        assert self._conn, "Call connect() before get_resolution_summary()"
+        async with self._conn.execute(
+            "SELECT outcome, edge_net_pct, simulated_pnl, confidence "
+            "FROM resolution_signals WHERE ts_ms >= ?",
+            (since_ts_ms,),
+        ) as cur:
+            rows = await cur.fetchall()
+
+        total = len(rows)
+        confirmed = sum(1 for r in rows if r["confidence"] == "confirmed")
+        total_pnl = Decimal("0")
+        edge_pcts: list[float] = []
+        for row in rows:
+            total_pnl += Decimal(str(row["simulated_pnl"]))
+            if row["edge_net_pct"] is not None:
+                edge_pcts.append(float(row["edge_net_pct"]))
+
+        median_edge = Decimal("0")
+        if edge_pcts:
+            median_edge = Decimal(str(statistics.median(edge_pcts)))
+
+        return {
+            "total_signals": total,
+            "confirmed_signals": confirmed,
+            "total_simulated_pnl": total_pnl,
+            "median_edge_net_pct": median_edge,
+        }
 
     async def insert_risk_event(
         self,

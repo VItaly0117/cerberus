@@ -155,6 +155,44 @@ ArbitrageResult = ArbitrageSignal
 
 
 # ---------------------------------------------------------------------------
+# Resolution arbitrage  (Sprint 4)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ResolutionSignal:
+    """A confirmed resolution-arbitrage opportunity.
+
+    The market outcome is already known from the Gamma API, but the market
+    is still trading below the resolution value (1.00 USDC per winning token).
+
+    Attributes:
+        market_id:      Polymarket market identifier.
+        condition_id:   Condition identifier (hex string).
+        outcome:        Confirmed outcome — ``"YES"`` or ``"NO"``.
+        token_id:       ERC-1155 token ID of the winning token to buy.
+        current_ask:    Best ask price for the winning token (should be < 1.00).
+        edge_net_pct:   (1.00 − current_ask − fee) / current_ask — net profit %.
+        fee_usdc:       Estimated taker fee in USDC for one notional unit.
+        confidence:     ``"confirmed"`` (Gamma returned outcome) or
+                        ``"probable"`` (end_date passed, outcome pending).
+        source:         Data source identifier, e.g. ``"gamma_api"``.
+        ts_ms:          Unix timestamp in milliseconds when signal was generated.
+    """
+
+    market_id: str
+    condition_id: str
+    outcome: str
+    token_id: str
+    current_ask: Decimal
+    edge_net_pct: Decimal
+    fee_usdc: Decimal
+    confidence: str
+    source: str
+    ts_ms: int
+
+
+# ---------------------------------------------------------------------------
 # Market discovery  (Agent B — float fields from Gamma API)
 # ---------------------------------------------------------------------------
 
