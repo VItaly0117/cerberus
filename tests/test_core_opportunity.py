@@ -374,3 +374,27 @@ class TestEvaluateOpportunity:
         assert isinstance(result.no_quote.coverage_pct, Decimal), (
             "no_quote.coverage_pct must be Decimal"
         )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Sprint 5 — division-by-zero guard (bug #2)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def test_calculate_effective_leg_zero_tokens_returns_none() -> None:
+    """Bug #2: when depth walk produces accumulated_tokens=0, return None
+    instead of crashing with ZeroDivisionError."""
+    fee_model = FeeModel()
+    config = _make_config()
+    asks = [
+        PriceLevel(price=Decimal("0.50"), size=Decimal("0.5")),
+        PriceLevel(price=Decimal("0.55"), size=Decimal("0.3")),
+    ]
+    result = calculate_effective_leg(
+        asks=asks,
+        notional_usdc=config.trade_notional_usdc,
+        fee_model=fee_model,
+        fee_params=config.fee_params,
+        min_order_size=Decimal("10"),  # all levels below this — all skipped
+        tick_size=config.tick_size,
+    )
+    assert result is None

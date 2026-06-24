@@ -355,15 +355,39 @@ class Executor:
             :class:`ArbitrageResult.REPAIRED` when the position is closed at
             break-even or better.
         """
+        # bug #8 fix: short-circuit when leg1 was reported FILLED but filled_size==0.
+        # In that case there is nothing to repair — recording a fake repair would
+        # falsify the audit trail and PnL accounting.
+        if leg1_result.filled_size <= Decimal("0"):
+            logger.warning(
+                "_emergency_repair[%s]: leg1 filled_size=0 — no position to repair",
+                snapshot.market_id,
+            )
+            await self._storage.insert_legged_event(
+                market_id=snapshot.market_id,
+                leg1_order_id=leg1_result.order_id,
+                leg2_order_id=leg2_result.order_id,
+                leg1_filled=leg1_result.filled_size,
+                leg2_filled=leg2_result.filled_size,
+                repair_action="no_position",
+                repair_loss_usdc=Decimal("0"),
+            )
+            return ArbitrageResult.REPAIRED
+
         leg1_cost: Decimal = leg1_result.filled_size * leg1_result.fill_price
 
         if self._dry_run_mode:
-            # Use best YES ask as the market-price proxy; apply 0.5 % slippage.
-            best_price: Decimal = (
-                snapshot.yes_asks[0].price
-                if snapshot.yes_asks
-                else leg1_result.fill_price
-            )
+            # bug #1 fix: yes_asks may be empty if orderbook resync produced no
+            # levels. Already guarded by ``if snapshot.yes_asks`` — make the
+            # fallback explicit and log so we can detect bad book state.
+            if snapshot.yes_asks:
+                best_price: Decimal = snapshot.yes_asks[0].price
+            else:
+                logger.warning(
+                    "_emergency_repair[%s]: empty yes_asks — using leg1 fill_price as proxy",
+                    snapshot.market_id,
+                )
+                best_price = leg1_result.fill_price
             sell_price: Decimal = best_price * Decimal("0.995")
         else:
             # Live: aggressive market sell — model slippage conservatively.

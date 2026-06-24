@@ -43,6 +43,10 @@ _MIN_ASK_LEVELS: int = 5
 _RECONNECT_BASE_S: int = 1
 _RECONNECT_MAX_S: int = 32
 
+# Resync back-off timing (per-market)
+_RESYNC_BASE_S: int = 1
+_RESYNC_MAX_S: int = 30
+
 
 class Watcher:
     """
@@ -87,6 +91,10 @@ class Watcher:
         self._token_to_cid: dict[str, str] = {}
         # current back-off delay in seconds; doubles on each failure, resets on success
         self._backoff: int = _RECONNECT_BASE_S
+
+        # Per-market resync back-off state (bug #9 — prevents tight retry loop)
+        self._resync_backoff_s: dict[str, float] = {}
+        self._resync_next_attempt_ms: dict[str, int] = {}
 
     # ── Configuration helpers ─────────────────────────────────────────────────
 
@@ -185,7 +193,18 @@ class Watcher:
 
             # ── Dispatch loop ─────────────────────────────────────────────────
             async for raw_message in ws:
-                event = json.loads(raw_message)
+                # bug #3 fix: malformed JSON should not crash the watcher loop
+                try:
+                    event = json.loads(raw_message)
+                except json.JSONDecodeError as exc:
+                    logger.warning(
+                        "Watcher: malformed JSON from WS, skipping (%s): %.200r",
+                        exc, raw_message,
+                    )
+                    continue
+                if not isinstance(event, dict):
+                    logger.warning("Watcher: non-dict event from WS — skipping: %r", event)
+                    continue
                 event_type = event.get("type") or event.get("event_type", "")
 
                 # ── Market-resolved event (no asset_id) ─────────────────────
@@ -239,22 +258,33 @@ class Watcher:
 
     async def _resync_from_rest(self, market_id: str) -> None:
         """
-        Fetch full L2 snapshots from the CLOB REST API for both legs of
-        *market_id* and apply them to the book, then clear ``needs_resync``.
+        Atomically resync both legs from the CLOB REST API.
 
-        On any HTTP error the method returns early, leaving ``needs_resync``
-        True so the next cycle will retry.
+        Sprint 5 fixes:
+          - bug #5: two-phase fetch — validate BOTH legs before applying either.
+            Prevents lopsided snapshots (YES fresh, NO stale).
+          - bug #6: reject empty ``asks`` lists; treat as failure.
+          - bug #9: per-market exponential back-off (1s → 30s) to prevent
+            hammering the REST API when it consistently fails.
         """
         market = self._active_markets.get(market_id)
         book = self._books.get(market_id)
         if market is None or book is None:
             return
 
+        # ── Back-off gate (bug #9) ────────────────────────────────────────────
+        now_ms_int = int(time.time() * 1000)
+        next_attempt = self._resync_next_attempt_ms.get(market_id, 0)
+        if now_ms_int < next_attempt:
+            return  # back-off active; skip this attempt
+
         yes_tid = market.yes_token_id
         no_tid = market.no_token_id
         logger.info("Watcher: resyncing book for market %s", market_id)
-        now_ms = str(int(time.time() * 1000))
+        now_ms = str(now_ms_int)
 
+        # ── Phase 1: fetch & validate BOTH legs (bug #5, #6) ──────────────────
+        fetched: dict[str, dict] = {}
         async with httpx.AsyncClient(timeout=10.0) as client:
             for token_id in (yes_tid, no_tid):
                 url = f"{self._clob_rest_url}/book"
@@ -264,23 +294,57 @@ class Watcher:
                     data = resp.json()
                 except Exception as exc:
                     logger.warning(
-                        "Watcher: resync REST call failed for token %s: %s",
-                        token_id,
-                        exc,
+                        "Watcher: resync REST call failed for token %s: %s — backing off.",
+                        token_id, exc,
                     )
-                    return  # leave needs_resync=True; will retry next cycle
+                    self._bump_resync_backoff(market_id)
+                    return
 
-                synthetic_event = {
-                    "event_type": "book",
-                    "asset_id": token_id,
-                    "asks": data.get("asks", []),
-                    "hash": data.get("hash", ""),
-                    "timestamp": now_ms,
-                }
-                book.apply_book_event(synthetic_event)
+                if not isinstance(data, dict):
+                    logger.warning(
+                        "Watcher: resync got non-dict payload for token %s — backing off.",
+                        token_id,
+                    )
+                    self._bump_resync_backoff(market_id)
+                    return
 
+                asks = data.get("asks", [])
+                if not isinstance(asks, list) or len(asks) == 0:
+                    logger.warning(
+                        "Watcher: resync got empty/invalid asks for token %s — backing off.",
+                        token_id,
+                    )
+                    self._bump_resync_backoff(market_id)
+                    return
+
+                fetched[token_id] = data
+
+        # ── Phase 2: atomic apply (both legs validated) ───────────────────────
+        for token_id, data in fetched.items():
+            synthetic_event = {
+                "event_type": "book",
+                "asset_id": token_id,
+                "asks": data.get("asks", []),
+                "hash": data.get("hash", ""),
+                "timestamp": now_ms,
+            }
+            book.apply_book_event(synthetic_event)
+
+        # Reset back-off and clear resync flag on success
+        self._resync_backoff_s.pop(market_id, None)
+        self._resync_next_attempt_ms.pop(market_id, None)
         book.needs_resync = False
         logger.info("Watcher: resync complete for market %s", market_id)
+
+    def _bump_resync_backoff(self, market_id: str) -> None:
+        """Double the resync back-off for *market_id* and update next-attempt time."""
+        current = self._resync_backoff_s.get(market_id, 0.0)
+        new_backoff = min(max(current * 2, _RESYNC_BASE_S), _RESYNC_MAX_S)
+        self._resync_backoff_s[market_id] = new_backoff
+        self._resync_next_attempt_ms[market_id] = int(time.time() * 1000) + int(new_backoff * 1000)
+        logger.info(
+            "Watcher: resync back-off for %s = %.1fs", market_id, new_backoff
+        )
 
     async def _handle_market_resolved(self, event: dict) -> None:
         """

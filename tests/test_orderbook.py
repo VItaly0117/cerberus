@@ -425,3 +425,45 @@ def test_apply_price_change_updates_existing_size(book: LocalOrderBook) -> None:
     assert book.yes_asks[0].price == Decimal("0.60")
     assert book.yes_asks[0].size  == Decimal("250")
     assert not book.needs_resync
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Sprint 5 — parsing-guard tests (bugs #4, #7, #10)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def test_parse_levels_skips_malformed_entries(book: LocalOrderBook) -> None:
+    """Bug #7: malformed level dicts must be skipped, not crash the book."""
+    raw = [
+        {"price": "0.50", "size": "100"},                # valid
+        {"size": "50"},                                  # missing 'price'
+        {"price": "bad", "size": "30"},                  # non-numeric price
+        {"price": "0.55", "size": "NaN"},                # non-finite size
+        {"price": "0.60", "size": "200"},                # valid
+    ]
+    levels = book._parse_levels(raw)
+    prices = sorted(str(lvl.price) for lvl in levels)
+    assert prices == ["0.50", "0.60"], (
+        f"Only valid levels should survive, got {prices}"
+    )
+
+
+def test_apply_changes_missing_keys_triggers_resync(book: LocalOrderBook) -> None:
+    """Bug #4: malformed change dicts must flag needs_resync, not crash."""
+    book.needs_resync = False
+    bad_changes = [
+        {"price": "0.50"},                  # missing 'size'
+        {"size": "100"},                    # missing 'price'
+        {"price": "bad", "size": "10"},     # malformed
+    ]
+    result = book._apply_changes([], bad_changes)
+    assert result == [], "Bad changes should not be applied"
+    assert book.needs_resync is True, "needs_resync must be set after malformed changes"
+
+
+def test_update_ts_invalid_string_marks_stale(book: LocalOrderBook) -> None:
+    """Bug #10: invalid timestamp must mark book stale, not silently keep old ts."""
+    book.ts_ms = 12345
+    book.needs_resync = False
+    book._update_ts({"timestamp": "not-a-number"})
+    assert book.ts_ms == 0, "Invalid timestamp must reset ts_ms to 0"
+    assert book.needs_resync is True, "Invalid timestamp must set needs_resync"

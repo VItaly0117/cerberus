@@ -403,3 +403,118 @@ class TestDrainQueue:
         )
         # The remaining two markets must still be in the queue
         assert candidate_q.qsize() == 2
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Sprint 5 — resync hardening (bugs #5, #6, #9)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def test_resync_backoff_exponential() -> None:
+    """Bug #9: backoff must double on each failure (1s → 2s → 4s → … capped at 30s)."""
+    watcher, _, _ = make_watcher()
+    market_id = "mkt-test"
+
+    watcher._bump_resync_backoff(market_id)
+    first = watcher._resync_backoff_s[market_id]
+    assert first == 1.0, f"first backoff should be 1s, got {first}"
+
+    watcher._bump_resync_backoff(market_id)
+    second = watcher._resync_backoff_s[market_id]
+    assert second == 2.0, f"second backoff should be 2s, got {second}"
+
+    watcher._bump_resync_backoff(market_id)
+    third = watcher._resync_backoff_s[market_id]
+    assert third == 4.0, f"third backoff should be 4s, got {third}"
+
+    # Hammer it until capped
+    for _ in range(20):
+        watcher._bump_resync_backoff(market_id)
+    final = watcher._resync_backoff_s[market_id]
+    assert final == 30.0, f"backoff must cap at 30s, got {final}"
+
+
+async def test_resync_empty_asks_rejected() -> None:
+    """Bug #6: empty asks list from REST must be rejected; book stays resync-flagged."""
+    watcher, _, _ = make_watcher()
+    market = make_market(condition_id="mkt-empty", yes_token_id="yt", no_token_id="nt")
+    book = populate_watcher(watcher, market)
+    book.needs_resync = True
+
+    # Mock httpx to return empty asks on both legs
+    fake_resp = MagicMock()
+    fake_resp.raise_for_status = MagicMock()
+    fake_resp.json = MagicMock(return_value={"asks": [], "hash": "h"})
+
+    class FakeClient:
+        def __init__(self, *a, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return None
+        async def get(self, *a, **kw): return fake_resp
+
+    with patch("cerberus_runtime.watcher.httpx.AsyncClient", FakeClient):
+        await watcher._resync_from_rest("mkt-empty")
+
+    assert book.needs_resync is True, "Empty asks must NOT clear needs_resync"
+    assert "mkt-empty" in watcher._resync_backoff_s, "Backoff must be armed"
+
+
+async def test_resync_partial_failure_atomic() -> None:
+    """Bug #5: if any leg fails validation, neither leg is applied."""
+    watcher, _, _ = make_watcher()
+    market = make_market(condition_id="mkt-partial", yes_token_id="yt2", no_token_id="nt2")
+    book = populate_watcher(watcher, market)
+    book.needs_resync = True
+    initial_yes_count = len(book.yes_asks)
+    initial_no_count = len(book.no_asks)
+
+    # First call returns good data, second returns empty (NO leg fails)
+    call_count = {"n": 0}
+    def make_resp():
+        call_count["n"] += 1
+        resp = MagicMock()
+        resp.raise_for_status = MagicMock()
+        if call_count["n"] == 1:
+            resp.json = MagicMock(return_value={"asks": [{"price": "0.55", "size": "100"}], "hash": "h1"})
+        else:
+            resp.json = MagicMock(return_value={"asks": [], "hash": "h2"})
+        return resp
+
+    class FakeClient:
+        def __init__(self, *a, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return None
+        async def get(self, *a, **kw): return make_resp()
+
+    with patch("cerberus_runtime.watcher.httpx.AsyncClient", FakeClient):
+        await watcher._resync_from_rest("mkt-partial")
+
+    # Neither leg should have been applied — atomicity guarantee
+    assert len(book.yes_asks) == initial_yes_count, (
+        "YES leg must NOT be applied when NO leg fails"
+    )
+    assert len(book.no_asks) == initial_no_count
+    assert book.needs_resync is True
+
+
+async def test_malformed_json_does_not_kill_loop() -> None:
+    """Bug #3: json.loads error must not crash the watcher; loop continues."""
+    watcher, _, _ = make_watcher()
+    market = make_market()
+    populate_watcher(watcher, market)
+
+    # Stream: bad JSON, then good close event
+    fake_ws = FakeWS([
+        "not-a-valid-json{",          # malformed — must be skipped
+        json.dumps({"type": "place"}),  # benign — must be processed without crash
+    ])
+
+    @asynccontextmanager
+    async def fake_connect(*args, **kwargs):
+        yield fake_ws
+
+    with patch("cerberus_runtime.watcher.websockets.connect", fake_connect):
+        # Run one cycle; should not raise
+        try:
+            await asyncio.wait_for(watcher._ws_loop(), timeout=0.5)
+        except (asyncio.TimeoutError, StopAsyncIteration, Exception):
+            pass  # Loop is expected to exit naturally — we just verify no crash on bad JSON

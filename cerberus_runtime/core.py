@@ -121,6 +121,14 @@ def calculate_effective_leg(
         )
         return None
 
+    # bug #2 fix: guard against division by zero when accumulated_tokens
+    # is 0 (can happen if all walked levels have zero size after filtering).
+    if accumulated_tokens <= Decimal("0"):
+        logger.debug(
+            "calculate_effective_leg: accumulated_tokens=0 — cannot compute avg_price"
+        )
+        return None
+
     avg_price: Decimal = accumulated_cost / accumulated_tokens
     fee_usdc: Decimal = fee_model.calculate_fee(accumulated_cost, fee_params, "taker")
 

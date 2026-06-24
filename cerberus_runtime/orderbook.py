@@ -15,11 +15,14 @@ Constraints
 from __future__ import annotations
 
 import hashlib
+import logging
 import time
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Optional
 
 from cerberus_runtime.models import FeeParams, OrderBookSnapshot, PriceLevel
+
+logger = logging.getLogger(__name__)
 
 
 class LocalOrderBook:
@@ -53,60 +56,94 @@ class LocalOrderBook:
     # ------------------------------------------------------------------ #
 
     def _update_ts(self, event: dict) -> None:
-        """Update ts_ms from the event's timestamp field (ms string)."""
-        ts_str = event.get("timestamp", "")
-        if ts_str:
-            try:
-                self.ts_ms = int(ts_str)
-            except (ValueError, TypeError):
-                pass
+        """Update ts_ms from the event's timestamp field (ms string).
 
-    @staticmethod
-    def _parse_levels(raw: list[dict]) -> list[PriceLevel]:
+        On parse failure: reset ts_ms=0 and flag needs_resync so the book
+        is treated as stale until the next REST resync (bug #10 fix).
+        """
+        ts_str = event.get("timestamp", "")
+        if not ts_str:
+            return
+        try:
+            self.ts_ms = int(ts_str)
+        except (ValueError, TypeError):
+            logger.warning(
+                "OrderBook: invalid timestamp %r — marking book stale.", ts_str
+            )
+            self.ts_ms = 0
+            self.needs_resync = True
+
+    def _parse_levels(self, raw: list[dict]) -> list[PriceLevel]:
         """
         Convert raw price-level dicts to a sorted list of PriceLevel.
 
-        Levels with size == 0 are discarded (they represent removals in
-        a delta, or are simply absent from a snapshot).
-
-        Both price and size are converted via ``Decimal(str(...))`` to avoid
-        floating-point contamination in downstream arithmetic.
+        Malformed entries (missing price/size, non-numeric, NaN, etc.) are
+        skipped with a warning rather than crashing the book state (bug #7).
+        Levels with size == 0 are discarded.
         """
         levels: list[PriceLevel] = []
         for entry in raw:
-            size = Decimal(str(entry.get("size", "0")))
-            if size > Decimal("0"):
-                levels.append(
-                    PriceLevel(
-                        price=Decimal(str(entry["price"])),
-                        size=size,
+            try:
+                if "price" not in entry:
+                    logger.warning("OrderBook: level missing 'price' — skipping: %s", entry)
+                    continue
+                price = Decimal(str(entry["price"]))
+                size = Decimal(str(entry.get("size", "0")))
+                if not price.is_finite() or not size.is_finite():
+                    logger.warning(
+                        "OrderBook: non-finite price/size — skipping: %s", entry
                     )
+                    continue
+                if size > Decimal("0"):
+                    levels.append(PriceLevel(price=price, size=size))
+            except (InvalidOperation, ValueError, TypeError, KeyError) as exc:
+                logger.warning(
+                    "OrderBook: malformed level %s (%s) — skipping.", entry, exc
                 )
+                continue
         levels.sort(key=lambda pl: pl.price)
         return levels
 
-    @staticmethod
     def _apply_changes(
+        self,
         current: list[PriceLevel],
         changes: list[dict],
     ) -> list[PriceLevel]:
         """
         Apply delta changes to an ask list and return the updated list.
 
-        A change with size == 0 removes the level; any other size adds
-        or replaces the level at that price.
-
-        String keys are used so Decimal precision is preserved exactly.
+        Malformed change entries (missing keys, non-numeric values) are
+        skipped and trigger needs_resync=True so the next REST resync
+        corrects state (bug #4).
         """
-        # Use string keys for exact price identity (no float rounding)
         book: dict[str, Decimal] = {str(pl.price): pl.size for pl in current}
         for ch in changes:
-            price_str = str(Decimal(str(ch["price"])))
-            size = Decimal(str(ch["size"]))
-            if size == Decimal("0"):
-                book.pop(price_str, None)
-            else:
-                book[price_str] = size
+            try:
+                if "price" not in ch or "size" not in ch:
+                    logger.warning(
+                        "OrderBook: change missing price/size — flagging resync: %s", ch
+                    )
+                    self.needs_resync = True
+                    continue
+                price = Decimal(str(ch["price"]))
+                size = Decimal(str(ch["size"]))
+                if not price.is_finite() or not size.is_finite():
+                    logger.warning(
+                        "OrderBook: non-finite change — flagging resync: %s", ch
+                    )
+                    self.needs_resync = True
+                    continue
+                price_str = str(price)
+                if size == Decimal("0"):
+                    book.pop(price_str, None)
+                else:
+                    book[price_str] = size
+            except (InvalidOperation, ValueError, TypeError, KeyError) as exc:
+                logger.warning(
+                    "OrderBook: malformed change %s (%s) — flagging resync.", ch, exc
+                )
+                self.needs_resync = True
+                continue
         return sorted(
             [PriceLevel(price=Decimal(p), size=s) for p, s in book.items()],
             key=lambda pl: pl.price,

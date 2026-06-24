@@ -17,6 +17,7 @@ Tag: [CERBERUS-STRATEGY-UPDATE]
 """
 from __future__ import annotations
 
+import time
 import uuid
 from decimal import Decimal
 from typing import List
@@ -417,3 +418,83 @@ def test_all_arithmetic_is_decimal():
         assert not isinstance(value, float), (
             f"OrderResult.{field_name} must not be float"
         )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Sprint 5 — emergency_repair guards (bugs #1, #8)
+# ──────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_emergency_repair_zero_fill_no_false_repaired():
+    """Bug #8: when leg1 status=FILLED but filled_size==0, repair must record
+    'no_position' with zero loss instead of falsely claiming a sale was made."""
+    storage = _make_mock_storage()
+    config = _make_config()
+    executor = Executor(storage=storage, config=config, dry_run_mode=True)
+
+    signal = _make_signal()
+    snapshot = OrderBookSnapshot(
+        market_id=signal.market_id,
+        yes_asks=[PriceLevel(price=Decimal("0.50"), size=Decimal("300"))],
+        no_asks=[PriceLevel(price=Decimal("0.45"), size=Decimal("300"))],
+        timestamp=float(time.time() * 1000),
+        yes_token_id="yes_tok",
+        no_token_id="no_tok",
+    )
+
+    # Pathological state: status=FILLED but no actual fill — emergency repair
+    # must short-circuit without computing fake loss.
+    leg1_result = OrderResult(
+        order_id="leg1", status="FILLED",
+        filled_size=Decimal("0"), fill_price=Decimal("0.50"),
+        fee_usdc=Decimal("0"),
+    )
+    leg2_result = OrderResult(
+        order_id="leg2", status="NOT_FILLED",
+        filled_size=Decimal("0"), fill_price=Decimal("0"),
+        fee_usdc=Decimal("0"),
+    )
+
+    result = await executor._emergency_repair(leg1_result, leg2_result, snapshot)
+
+    assert result == ArbitrageResult.REPAIRED
+    storage.insert_legged_event.assert_called_once()
+    call_kwargs = storage.insert_legged_event.call_args.kwargs
+    assert call_kwargs["repair_action"] == "no_position", (
+        "Zero-fill leg1 must record 'no_position', not a fake sale"
+    )
+    assert call_kwargs["repair_loss_usdc"] == Decimal("0")
+
+
+@pytest.mark.asyncio
+async def test_emergency_repair_empty_orderbook_no_crash():
+    """Bug #1: empty yes_asks must use leg1.fill_price as fallback, not crash with IndexError."""
+    storage = _make_mock_storage()
+    config = _make_config()
+    executor = Executor(storage=storage, config=config, dry_run_mode=True)
+
+    signal = _make_signal()
+    snapshot = OrderBookSnapshot(
+        market_id=signal.market_id,
+        yes_asks=[],                          # ← empty book (post-resync corruption)
+        no_asks=[PriceLevel(price=Decimal("0.45"), size=Decimal("300"))],
+        timestamp=float(time.time() * 1000),
+        yes_token_id="yes_tok",
+        no_token_id="no_tok",
+    )
+
+    leg1_result = OrderResult(
+        order_id="leg1", status="FILLED",
+        filled_size=Decimal("50"), fill_price=Decimal("0.50"),
+        fee_usdc=Decimal("0"),
+    )
+    leg2_result = OrderResult(
+        order_id="leg2", status="NOT_FILLED",
+        filled_size=Decimal("0"), fill_price=Decimal("0"),
+        fee_usdc=Decimal("0"),
+    )
+
+    # Must NOT raise IndexError; result depends on repair_loss but either is fine
+    result = await executor._emergency_repair(leg1_result, leg2_result, snapshot)
+    assert result in (ArbitrageResult.REPAIRED, ArbitrageResult.LEGGED_RISK)
+    storage.insert_legged_event.assert_called_once()
