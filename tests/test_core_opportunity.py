@@ -46,6 +46,8 @@ def _make_config(**overrides) -> AppConfig:
         fee_params=FeeParams(
             fees_enabled=True, taker_fee_rate=0.005, maker_fee_rate=0.001
         ),
+        # Sprint 6 — relax depth gate for legacy tests; gate-specific tests override.
+        min_levels_consumed=1,
     )
     defaults.update(overrides)
     return AppConfig(**defaults)
@@ -398,3 +400,45 @@ def test_calculate_effective_leg_zero_tokens_returns_none() -> None:
         tick_size=config.tick_size,
     )
     assert result is None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Sprint 6 — depth gate (min_levels_consumed)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def test_min_levels_consumed_gate_rejects_single_tick_book():
+    """Sprint 6: a book with only 1 ask level on either leg must be rejected
+    when min_levels_consumed >= 2, even if edge is positive."""
+    fee_model = FeeModel()
+    config = _make_config(min_levels_consumed=2)
+    # Single ask level on YES leg — should fail the depth gate.
+    snapshot = OrderBookSnapshot(
+        market_id="mkt-shallow",
+        yes_asks=[PriceLevel(price=Decimal("0.40"), size=Decimal("500"))],
+        no_asks=[
+            PriceLevel(price=Decimal("0.45"), size=Decimal("200")),
+            PriceLevel(price=Decimal("0.46"), size=Decimal("200")),
+        ],
+        timestamp=1_000.0,
+        yes_token_id="y",
+        no_token_id="n",
+    )
+    result = evaluate_opportunity(snapshot, config, fee_model)
+    assert result is None, "Single-level YES book must be rejected by depth gate"
+
+
+def test_min_levels_consumed_one_allows_single_tick_book():
+    """When min_levels_consumed=1, single-tick books are allowed (legacy behavior)."""
+    fee_model = FeeModel()
+    config = _make_config(min_levels_consumed=1)
+    snapshot = OrderBookSnapshot(
+        market_id="mkt-shallow",
+        yes_asks=[PriceLevel(price=Decimal("0.40"), size=Decimal("500"))],
+        no_asks=[PriceLevel(price=Decimal("0.45"), size=Decimal("500"))],
+        timestamp=1_000.0,
+        yes_token_id="y",
+        no_token_id="n",
+    )
+    result = evaluate_opportunity(snapshot, config, fee_model)
+    # Edge math: 1.00 - (0.40 + 0.45) = 0.15 — comfortably profitable
+    assert result is not None, "Single-level book should pass when gate disabled"

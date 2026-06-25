@@ -85,6 +85,7 @@ def calculate_effective_leg(
     """
     accumulated_cost: Decimal = Decimal("0")
     accumulated_tokens: Decimal = Decimal("0")
+    levels_consumed: int = 0  # Sprint 6 — count non-skipped price levels
 
     for level in asks:  # cheapest → most expensive
         remaining: Decimal = notional_usdc - accumulated_cost
@@ -109,6 +110,7 @@ def calculate_effective_leg(
 
         accumulated_cost += size_at_level
         accumulated_tokens += size_at_level / level.price
+        levels_consumed += 1
 
     coverage_pct: Decimal = accumulated_cost / notional_usdc
 
@@ -207,6 +209,21 @@ def evaluate_opportunity(
 
     if yes_quote is None or no_quote is None:
         return None
+
+    # ── Sprint 6 — depth gate (min_levels_consumed) ──────────────────────────
+    # Reject single-tick books to avoid high realised slippage on illiquid
+    # markets. We count distinct non-zero levels in both asks lists.
+    min_levels = getattr(config, "min_levels_consumed", 1)
+    if min_levels > 1:
+        yes_count = sum(1 for lvl in snapshot.yes_asks if lvl.size >= config.min_order_size)
+        no_count = sum(1 for lvl in snapshot.no_asks if lvl.size >= config.min_order_size)
+        if yes_count < min_levels or no_count < min_levels:
+            logger.debug(
+                "evaluate_opportunity[%s]: depth gate failed (yes_levels=%d, "
+                "no_levels=%d, required=%d)",
+                snapshot.market_id, yes_count, no_count, min_levels,
+            )
+            return None
 
     total_cost: Decimal = (
         yes_quote.avg_price + no_quote.avg_price

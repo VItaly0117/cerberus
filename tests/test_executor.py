@@ -57,6 +57,9 @@ def _make_config(**overrides) -> AppConfig:
         min_order_size=Decimal("1.0"),
         tick_size=Decimal("0.01"),
         fee_params=None,
+        # Sprint 6 — relax drift guard so existing tests focus on their original intent.
+        # Drift-specific tests override max_drift_pct explicitly.
+        max_drift_pct=Decimal("0.10"),
     )
     defaults.update(overrides)
     return AppConfig(**defaults)
@@ -498,3 +501,52 @@ async def test_emergency_repair_empty_orderbook_no_crash():
     result = await executor._emergency_repair(leg1_result, leg2_result, snapshot)
     assert result in (ArbitrageResult.REPAIRED, ArbitrageResult.LEGGED_RISK)
     storage.insert_legged_event.assert_called_once()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Sprint 6 — Market drift guard
+# ──────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_drift_guard_aborts_on_price_move():
+    """Sprint 6: when fresh snapshot price differs from signal by > max_drift_pct,
+    execute_pair must abort with BLOCKED_BY_RISK (DRIFT_REJECT)."""
+    storage = _make_mock_storage()
+    config = _make_config(max_drift_pct=Decimal("0.003"))  # tight 0.3% gate
+    executor = Executor(storage=storage, config=config, dry_run_mode=True)
+
+    signal = _make_signal()  # signal at yes=0.45, no=0.50 — sum=0.95
+    # Fresh snapshot: market drifted significantly (sum=0.97 instead of 0.95)
+    snapshot = OrderBookSnapshot(
+        market_id=signal.market_id,
+        yes_asks=[PriceLevel(price=Decimal("0.47"), size=Decimal("500"))],
+        no_asks=[PriceLevel(price=Decimal("0.50"), size=Decimal("500"))],
+        timestamp=float(time.time() * 1000),
+        yes_token_id="yes_tok",
+        no_token_id="no_tok",
+    )
+
+    result = await executor.execute_pair(signal, snapshot)
+    assert result == ArbitrageResult.BLOCKED_BY_RISK
+
+
+@pytest.mark.asyncio
+async def test_drift_guard_allows_within_tolerance():
+    """Sprint 6: drift smaller than max_drift_pct must NOT trigger abort."""
+    storage = _make_mock_storage()
+    config = _make_config(max_drift_pct=Decimal("0.05"))  # generous 5% gate
+    executor = Executor(storage=storage, config=config, dry_run_mode=True)
+
+    signal = _make_signal()
+    snapshot = OrderBookSnapshot(
+        market_id=signal.market_id,
+        yes_asks=[PriceLevel(price=Decimal("0.45"), size=Decimal("500"))],
+        no_asks=[PriceLevel(price=Decimal("0.50"), size=Decimal("500"))],
+        timestamp=float(time.time() * 1000),
+        yes_token_id="yes_tok",
+        no_token_id="no_tok",
+    )
+
+    result = await executor.execute_pair(signal, snapshot)
+    # Drift is 0 — must NOT be BLOCKED_BY_RISK for that reason
+    assert result != ArbitrageResult.BLOCKED_BY_RISK

@@ -110,20 +110,23 @@ class AppConfig:
     """
 
     # ── Trading parameters ────────────────────────────────────────────────────
+    # Sprint 6 calibration: thresholds raised to cover realistic costs.
+    # Previously: edge 1.25% vs ~1.5% real costs = mathematically -EV.
+    # Now: edge ≥ 2% with 1% combined risk buffers.
     trade_notional_usdc: Decimal = field(
-        default_factory=lambda: Decimal("25")
+        default_factory=lambda: Decimal("50")  # was 25; larger for statistical signal
     )
     slippage_buffer_pct: Decimal = field(
-        default_factory=lambda: Decimal("0.001")
+        default_factory=lambda: Decimal("0.005")  # was 0.001; calibrated 5x
     )
     legged_risk_buffer_pct: Decimal = field(
-        default_factory=lambda: Decimal("0.001")
+        default_factory=lambda: Decimal("0.003")  # was 0.001; calibrated 3x
     )
     min_net_edge_usd: Decimal = field(
-        default_factory=lambda: Decimal("0.10")
+        default_factory=lambda: Decimal("0.40")  # was 0.10; proportional to notional
     )
     min_net_edge_pct: Decimal = field(
-        default_factory=lambda: Decimal("0.0125")
+        default_factory=lambda: Decimal("0.020")  # was 0.0125; covers real costs
     )
     min_order_size: Decimal = field(
         default_factory=lambda: Decimal("1")
@@ -132,6 +135,13 @@ class AppConfig:
         default_factory=lambda: Decimal("0.01")
     )
     fee_params: Optional[FeeParams] = None
+
+    # ── Sprint 6 — pre-execution sanity gates ─────────────────────────────────
+    max_drift_pct: Decimal = field(
+        default_factory=lambda: Decimal("0.003")  # 0.3% drift between signal & exec
+    )
+    max_spread_ticks: int = 2  # reject if best_bid-best_ask spread > N ticks
+    min_levels_consumed: int = 2  # reject single-tick books (no depth)
 
     # ── Risk parameters ───────────────────────────────────────────────────────
     dry_run_mode: bool = True
@@ -146,17 +156,23 @@ class AppConfig:
 
 
 def get_app_config() -> AppConfig:
-    """Build an AppConfig from environment variables with paper-trading defaults."""
+    """Build an AppConfig from environment variables with paper-trading defaults.
+
+    Sprint 6: all thresholds env-overridable for A/B testing on VPS.
+    """
     return AppConfig(
-        trade_notional_usdc=Decimal(os.getenv("TRADE_NOTIONAL_USDC", "25")),
-        slippage_buffer_pct=Decimal(os.getenv("SLIPPAGE_BUFFER_PCT", "0.001")),
+        trade_notional_usdc=Decimal(os.getenv("TRADE_NOTIONAL_USDC", "50")),
+        slippage_buffer_pct=Decimal(os.getenv("SLIPPAGE_BUFFER_PCT", "0.005")),
         legged_risk_buffer_pct=Decimal(
-            os.getenv("LEGGED_RISK_BUFFER_PCT", "0.001")
+            os.getenv("LEGGED_RISK_BUFFER_PCT", "0.003")
         ),
-        min_net_edge_usd=Decimal(os.getenv("MIN_NET_EDGE_USD", "0.10")),
-        min_net_edge_pct=Decimal(os.getenv("MIN_NET_EDGE_PCT", "0.0125")),
+        min_net_edge_usd=Decimal(os.getenv("MIN_NET_EDGE_USD", "0.40")),
+        min_net_edge_pct=Decimal(os.getenv("MIN_NET_EDGE_PCT", "0.020")),
         min_order_size=Decimal(os.getenv("MIN_ORDER_SIZE", "1")),
         tick_size=Decimal(os.getenv("TICK_SIZE", "0.01")),
+        max_drift_pct=Decimal(os.getenv("MAX_DRIFT_PCT", "0.003")),
+        max_spread_ticks=int(os.getenv("MAX_SPREAD_TICKS", "2")),
+        min_levels_consumed=int(os.getenv("MIN_LEVELS_CONSUMED", "2")),
         dry_run_mode=os.getenv("DRY_RUN_MODE", "true").lower() != "false",
         allow_live_mode=os.getenv("ALLOW_LIVE_MODE", "false").lower() == "true",
         max_book_age_ms=int(os.getenv("MAX_BOOK_AGE_MS", "5000")),

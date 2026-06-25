@@ -195,7 +195,21 @@ class Executor:
             :class:`ArbitrageResult` enum value indicating the execution outcome.
         """
         # ------------------------------------------------------------------
-        # Step 0: Re-quote check — abort if edge has degraded too much
+        # Step 0a: Sprint 6 — Market drift guard
+        # Compare signal price (yes+no) vs current snapshot top-of-book.
+        # If drift exceeds max_drift_pct → DRIFT_REJECT (market moved away).
+        # ------------------------------------------------------------------
+        drift_reject = self._check_market_drift(signal, fresh_snapshot)
+        if drift_reject:
+            logger.info(
+                "execute_pair[%s]: market drift > %.3f%% → DRIFT_REJECT",
+                signal.market_id,
+                float(self._config.max_drift_pct) * 100,
+            )
+            return ArbitrageResult.BLOCKED_BY_RISK
+
+        # ------------------------------------------------------------------
+        # Step 0b: Re-quote check — abort if edge has degraded too much
         # ------------------------------------------------------------------
         fresh_edge: Optional[Decimal] = self._evaluate_fresh_edge(fresh_snapshot)
         threshold: Decimal = self._config.min_net_edge_usd * Decimal("0.8")
@@ -289,6 +303,29 @@ class Executor:
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
+
+    def _check_market_drift(
+        self,
+        signal: ArbitrageSignal,
+        snapshot: OrderBookSnapshot,
+    ) -> bool:
+        """Sprint 6 — return True if market drifted past max_drift_pct.
+
+        Compares the signal's effective prices (yes_avg + no_avg) against
+        the current top-of-book sum. If absolute drift exceeds the threshold,
+        the trade should be aborted as the opportunity has degraded.
+        """
+        if not snapshot.yes_asks or not snapshot.no_asks:
+            return True  # no book to compare — treat as drift
+
+        signal_sum = signal.yes_quote.avg_price + signal.no_quote.avg_price
+        fresh_sum = snapshot.yes_asks[0].price + snapshot.no_asks[0].price
+
+        if signal_sum <= Decimal("0"):
+            return True
+
+        drift = abs(fresh_sum - signal_sum) / signal_sum
+        return drift > self._config.max_drift_pct
 
     def _evaluate_fresh_edge(
         self, snapshot: OrderBookSnapshot
