@@ -52,6 +52,14 @@ CREATE TABLE IF NOT EXISTS paper_signals (
 );
 """
 
+_DDL_RUNTIME_HEALTH = """
+CREATE TABLE IF NOT EXISTS runtime_health (
+    key         TEXT PRIMARY KEY,
+    value       TEXT NOT NULL,
+    updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+"""
+
 _DDL_RESOLUTION = """
 CREATE TABLE IF NOT EXISTS resolution_signals (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -136,6 +144,7 @@ class Storage:
         self._conn.row_factory = aiosqlite.Row
         await self._conn.executescript(_DDL)
         await self._conn.executescript(_DDL_RESOLUTION)
+        await self._conn.executescript(_DDL_RUNTIME_HEALTH)
         await self._conn.commit()
         logger.debug("Storage connected: %s", self.db_path)
 
@@ -379,6 +388,27 @@ class Storage:
     # ------------------------------------------------------------------
     # RiskManager storage interface
     # ------------------------------------------------------------------
+
+    async def upsert_runtime_health(self, key: str, value: str) -> None:
+        """Insert or update one runtime_health row (Sprint 7 metric flush)."""
+        assert self._conn, "Call connect() before upsert_runtime_health()"
+        await self._conn.execute(
+            "INSERT INTO runtime_health (key, value, updated_at) "
+            "VALUES (?, ?, datetime('now')) "
+            "ON CONFLICT(key) DO UPDATE SET "
+            "value = excluded.value, updated_at = excluded.updated_at",
+            (key, value),
+        )
+        await self._conn.commit()
+
+    async def get_runtime_health(self) -> dict[str, str]:
+        """Return all current runtime_health rows as a dict."""
+        assert self._conn, "Call connect() before get_runtime_health()"
+        async with self._conn.execute(
+            "SELECT key, value FROM runtime_health"
+        ) as cur:
+            rows = await cur.fetchall()
+        return {row["key"]: row["value"] for row in rows}
 
     async def insert_resolution_signal(
         self,

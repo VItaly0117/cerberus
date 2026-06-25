@@ -59,6 +59,7 @@ try:
     from cerberus_runtime.watcher import Watcher
     from cerberus_runtime.risk import RiskManager, ArbitrageResult as RiskResult
     from cerberus_runtime.executor import Executor, ArbitrageResult as ExecResult
+    from cerberus_runtime import metrics as _metrics
     _IMPORTS_OK = True
     _IMPORT_ERROR: Optional[str] = None
 except Exception as exc:  # pragma: no cover
@@ -198,9 +199,14 @@ async def _core_loop(
 
         evaluated += 1
         counters["evaluated"] = evaluated
+        _metrics.incr("snapshots_evaluated")
         market_id = snapshot.market_id
         condition_id = snapshot.condition_id or market_id
         ts_ms = snapshot.ts_ms or int(time.time() * 1000)
+        _metrics.set_gauge("last_snapshot_ts_ms", ts_ms)
+        _metrics.set_gauge(
+            "book_staleness_ms", max(0, int(time.time() * 1000) - ts_ms)
+        )
 
         # ── Risk gate ────────────────────────────────────────────────────
         allowed, reason = risk_manager.allows(snapshot)
@@ -208,6 +214,7 @@ async def _core_loop(
             logger.info(
                 "BLOCKED [%s] reason=%s", market_id, reason
             )
+            _metrics.record_reject(reason or "BLOCKED_BY_RISK", market_id=market_id)
             await storage.insert_paper_signal_from_snapshot(
                 market_id=market_id,
                 condition_id=condition_id,
@@ -225,6 +232,7 @@ async def _core_loop(
         signal = _core.evaluate_opportunity(snapshot, app_config, fee_model)
         if signal is None:
             logger.debug("FILTERED [%s] edge below threshold", market_id)
+            _metrics.record_reject("EDGE_BELOW_THRESHOLD", market_id=market_id)
             await storage.insert_paper_signal_from_snapshot(
                 market_id=market_id,
                 condition_id=condition_id,
@@ -238,17 +246,22 @@ async def _core_loop(
             continue
 
         # ── Execute (dry-run) ─────────────────────────────────────────────
+        _metrics.incr("signals_emitted")
+        _metrics.set_gauge("last_signal_ts_ms", ts_ms)
         exec_result = await executor.execute_pair(signal, snapshot)
 
         if exec_result == ExecResult.SUCCESS:
             simulated_pnl = signal.edge_net
             counters["successes"] += 1
+            _metrics.incr("executions_filled")
         elif exec_result in (ExecResult.LEGGED_RISK, ExecResult.REPAIRED):
             simulated_pnl = Decimal("-0.10")
             counters["legged"] += 1
+            _metrics.incr("executions_legged")
         else:
             simulated_pnl = Decimal("0")
             counters["clean_misses"] += 1
+            _metrics.incr("executions_clean_miss")
 
         logger.info(
             "SIGNAL [%s] result=%s edge_net=%s pnl=%s",
@@ -305,6 +318,31 @@ async def _stats_printer(
             break
         summary = await storage.get_paper_summary(since_ts_ms=0)
         _print_summary(summary, prefix="[LIVE STATS] ")
+
+
+async def _metrics_flusher(
+    storage: Storage,
+    stop_event: asyncio.Event,
+    interval_s: int = 30,
+) -> None:
+    """Sprint 7: Periodically flush in-memory metrics to runtime_health table
+    and append a JSONL snapshot for offline analysis."""
+    artifacts_dir = "artifacts/paper"
+    jsonl_path = f"{artifacts_dir}/metrics.log"
+    while not stop_event.is_set():
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(stop_event.wait()), timeout=interval_s
+            )
+        except asyncio.TimeoutError:
+            pass
+        if stop_event.is_set():
+            break
+        try:
+            await _metrics.flush_to_storage(storage)
+            _metrics.write_jsonl(jsonl_path)
+        except Exception as exc:
+            logger.warning("Metrics flush failed: %s", exc)
 
 
 def _print_summary(summary: dict, prefix: str = "") -> None:
@@ -468,6 +506,10 @@ async def run_paper(
         asyncio.create_task(
             _stats_printer(storage, stop_event, interval_s=LIVE_STATS_INTERVAL_S),
             name="stats",
+        ),
+        asyncio.create_task(
+            _metrics_flusher(storage, stop_event, interval_s=30),
+            name="metrics_flusher",
         ),
         asyncio.create_task(_duration_guard(), name="duration"),
     ]
