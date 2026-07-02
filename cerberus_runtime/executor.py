@@ -162,13 +162,13 @@ class Executor:
         self._aggressive_fill_cap = aggressive_fill_cap
         self._fee_model = FeeModel()
 
-        # _py_clob_client: initialized only when allow_live_mode=True.
+        # Initialize CLOB client for live trading.
         # In dry_run_mode: always None — no CLOB API calls ever made.
         if dry_run_mode:
             self._client = None
+        elif config.allow_live_mode and config.polymarket_private_key:
+            self._client = self._init_live_client(config)
         else:
-            # Live-mode stub: real py_clob_client initialization goes here.
-            # MVP: remains None until CLOB integration is complete.
             self._client = None
 
     # ------------------------------------------------------------------
@@ -241,10 +241,18 @@ class Executor:
             "order_type": "FOK",
         }
 
+        _use_maker = getattr(signal, "order_strategy", "FOK") == "MAKER"
         if self._dry_run_mode:
-            leg1_result: OrderResult = self._simulate_fill(
-                order_params_1, fresh_snapshot.yes_asks
-            )
+            if _use_maker:
+                order_params_1["asks"] = fresh_snapshot.yes_asks
+                order_params_1["order_type"] = "LIMIT"
+                leg1_result: OrderResult = await self._send_maker_order(order_params_1)
+            else:
+                leg1_result = self._simulate_fill(order_params_1, fresh_snapshot.yes_asks)
+        elif _use_maker:
+            order_params_1["asks"] = fresh_snapshot.yes_asks
+            order_params_1["order_type"] = "LIMIT"
+            leg1_result = await self._send_maker_order(order_params_1)  # sequential ①
         else:
             leg1_result = await self._send_order(order_params_1)  # sequential ①
 
@@ -276,9 +284,16 @@ class Executor:
         }
 
         if self._dry_run_mode:
-            leg2_result: OrderResult = self._simulate_fill(
-                order_params_2, fresh_snapshot.no_asks
-            )
+            if _use_maker:
+                order_params_2["asks"] = fresh_snapshot.no_asks
+                order_params_2["order_type"] = "LIMIT"
+                leg2_result: OrderResult = await self._send_maker_order(order_params_2)
+            else:
+                leg2_result = self._simulate_fill(order_params_2, fresh_snapshot.no_asks)
+        elif _use_maker:
+            order_params_2["asks"] = fresh_snapshot.no_asks
+            order_params_2["order_type"] = "LIMIT"
+            leg2_result = await self._send_maker_order(order_params_2)  # sequential ②
         else:
             leg2_result = await self._send_order(order_params_2)  # sequential ②
 
@@ -457,23 +472,188 @@ class Executor:
         )
         return ArbitrageResult.REPAIRED
 
+    @staticmethod
+    def _init_live_client(config):
+        """Initialize the Polymarket CLOB client for live order placement.
+
+        Requires py_clob_client to be installed.  Returns None if the library
+        is not available or credentials are missing.
+        """
+        try:
+            from py_clob_client.client import ClobClient
+            from py_clob_client.clob_types import ApiCreds
+        except ImportError:
+            logger.warning(
+                "py_clob_client not installed — live trading unavailable. "
+                "Run: pip install py-clob-client"
+            )
+            return None
+
+        if not config.polymarket_private_key:
+            logger.error("POLYMARKET_PK not set — live client not initialized")
+            return None
+
+        creds = None
+        if config.polymarket_api_key:
+            creds = ApiCreds(
+                api_key=config.polymarket_api_key,
+                api_secret=config.polymarket_api_secret,
+                api_passphrase=config.polymarket_api_passphrase,
+            )
+
+        client = ClobClient(
+            host=config.clob_rest_url,
+            key=config.polymarket_private_key,
+            chain_id=config.polymarket_chain_id,
+            creds=creds,
+        )
+        logger.info("Polymarket CLOB client initialized (chain_id=%d)", config.polymarket_chain_id)
+        return client
+
     async def _send_order(self, order_params: Dict) -> OrderResult:
-        """Send a live order to the CLOB.
+        """Send a live FOK order to the Polymarket CLOB.
 
         Called **only** in non-dry-run mode and **always** awaited sequentially
-        (never gathered).  Raises :exc:`RuntimeError` if accidentally called in
-        dry-run mode.
+        (never gathered).
 
         Raises:
-            RuntimeError:       If called in dry-run mode (programming error).
-            NotImplementedError: Until py_clob_client integration is complete.
+            RuntimeError: If called in dry-run mode (programming error).
+            RuntimeError: If CLOB client not initialized.
         """
         if self._dry_run_mode:
             raise RuntimeError(
                 "_send_order called in dry_run_mode — this is a bug in executor"
             )
-        raise NotImplementedError(
-            "Live CLOB integration not yet implemented; use dry_run_mode=True"
+        if self._client is None:
+            raise RuntimeError(
+                "CLOB client not initialized — check POLYMARKET_PK and ALLOW_LIVE_MODE"
+            )
+        try:
+            from py_clob_client.clob_types import OrderArgs, OrderType
+        except ImportError:
+            raise RuntimeError("py_clob_client not installed — cannot send live orders")
+
+        order_args = OrderArgs(
+            token_id=order_params["token_id"],
+            price=float(order_params["price"]),
+            size=float(order_params["size"]),
+        )
+        # FOK order: fill or kill immediately
+        resp = self._client.create_and_post_order(order_args, OrderType.FOK)
+
+        status: Literal["FILLED", "PARTIAL", "NOT_FILLED"] = "NOT_FILLED"
+        filled_size = Decimal("0")
+        fill_price = Decimal("0")
+
+        if resp and resp.get("status") == "matched":
+            filled = resp.get("filled_size", 0)
+            requested = float(order_params["size"])
+            filled_size = Decimal(str(filled))
+            fill_price = Decimal(str(order_params["price"]))
+            status = "FILLED" if filled >= requested * 0.99 else "PARTIAL"
+
+        fee_usdc = self._fee_model.calculate_fee(
+            filled_size * fill_price,
+            self._config.fee_params,
+            order_side="taker",
+        )
+        return OrderResult(
+            order_id=resp.get("order_id", str(uuid.uuid4())) if resp else str(uuid.uuid4()),
+            status=status,
+            filled_size=filled_size,
+            fill_price=fill_price,
+            fee_usdc=fee_usdc,
+        )
+
+    async def _send_maker_order(self, order_params: Dict) -> OrderResult:
+        """Post a limit (maker) order and poll for fill up to timeout.
+
+        In dry-run: immediately simulates fill using _simulate_fill.
+        In live: posts limit order via CLOB, polls for fill.
+        """
+        if self._dry_run_mode:
+            # Reuse FOK simulation but with limit price — maker fills if ask <= limit.
+            sim_params = {
+                "price": order_params["price"],
+                "size": order_params["size"],
+                "token_id": order_params.get("token_id", ""),
+                "side": "BUY",
+            }
+            result = self._simulate_fill(sim_params, order_params.get("asks", []))
+            # Override fee to reflect maker (zero fee on Polymarket).
+            return OrderResult(
+                order_id=result.order_id,
+                status=result.status,
+                filled_size=result.filled_size,
+                fill_price=result.fill_price,
+                fee_usdc=self._fee_model.calculate_fee(
+                    result.filled_size * result.fill_price,
+                    self._config.fee_params,
+                    order_side="maker",
+                ),
+            )
+
+        if self._client is None:
+            raise RuntimeError("CLOB client not initialized")
+        try:
+            from py_clob_client.clob_types import OrderArgs, OrderType
+        except ImportError:
+            raise RuntimeError("py_clob_client not installed")
+
+        order_args = OrderArgs(
+            token_id=order_params["token_id"],
+            price=float(order_params["price"]),
+            size=float(order_params["size"]),
+        )
+        resp = self._client.create_and_post_order(order_args, OrderType.GTC)
+        order_id = resp.get("order_id", str(uuid.uuid4())) if resp else str(uuid.uuid4())
+
+        timeout = self._config.maker_timeout_seconds
+        import asyncio as _asyncio
+        import time as _time
+        deadline = _time.monotonic() + timeout
+        filled_size = Decimal("0")
+        fill_price = Decimal(str(order_params["price"]))
+
+        while _time.monotonic() < deadline:
+            await _asyncio.sleep(2)
+            try:
+                order_info = self._client.get_order(order_id)
+                filled = float(order_info.get("size_matched", 0))
+                filled_size = Decimal(str(filled))
+                if order_info.get("status") in ("matched", "filled"):
+                    break
+            except Exception:
+                pass
+
+        # Cancel unfilled portion
+        if filled_size < Decimal(str(order_params["size"])) * self._config.maker_min_fill_pct:
+            try:
+                self._client.cancel_order(order_id)
+            except Exception:
+                pass
+
+        status: Literal["FILLED", "PARTIAL", "NOT_FILLED"]
+        requested = Decimal(str(order_params["size"]))
+        if filled_size >= requested * Decimal("0.99"):
+            status = "FILLED"
+        elif filled_size >= requested * self._config.maker_min_fill_pct:
+            status = "PARTIAL"
+        else:
+            status = "NOT_FILLED"
+            filled_size = Decimal("0")
+
+        fee_usdc = self._fee_model.calculate_fee(
+            filled_size * fill_price,
+            self._config.fee_params,
+            order_side="maker",
+        )
+        return OrderResult(
+            order_id=order_id,
+            status=status,
+            filled_size=filled_size,
+            fill_price=fill_price,
+            fee_usdc=fee_usdc,
         )
 
     def _simulate_fill(

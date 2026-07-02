@@ -32,10 +32,10 @@ _RESCAN_INTERVAL: int = 300          # seconds between full scans
 _REQUEST_TIMEOUT: float = 10.0       # HTTP timeout (seconds)
 _BACKOFF_BASE: int = 2               # first back-off delay on 429 (seconds)
 _BACKOFF_MAX: int = 64               # ceiling for exponential back-off
-_MIN_VOLUME_24H: float = 1_000.0     # USDC
-_MAX_VOLUME_24H: float = 15_000.0    # USDC
-_MIN_DAYS_TO_END: int = 3
-_MAX_DAYS_TO_END: int = 30
+_MIN_VOLUME_24H: float = 200.0       # USDC — lowered for 2026 market structure
+_MAX_VOLUME_24H: float = 2_000_000.0  # USDC — raised: Polymarket $26B/mo in 2026
+_MIN_DAYS_TO_END: int = 1    # lowered: include markets resolving tomorrow
+_MAX_DAYS_TO_END: int = 90   # raised: include longer-dated markets
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -217,11 +217,29 @@ class MarketDiscovery:
             return False
         if raw.get("closed", True):
             return False
-        if raw.get("neg_risk", True):
+        # API returns camelCase "negRisk"; fall back to snake_case for compatibility.
+        if raw.get("negRisk") or raw.get("neg_risk"):
             return False
 
         # ── Binary token structure ───────────────────────────────────────────
+        # Gamma API may provide tokens as objects with outcome/token_id fields
+        # (old format) or as a JSON string in clobTokenIds (new format, 2026).
         tokens: List[Dict[str, Any]] = raw.get("tokens") or []
+        clob_ids_raw = raw.get("clobTokenIds")
+        if not tokens and clob_ids_raw:
+            # clobTokenIds is a JSON string: '["id1","id2"]'
+            try:
+                import json as _json
+                clob_ids = _json.loads(clob_ids_raw) if isinstance(clob_ids_raw, str) else clob_ids_raw
+                if len(clob_ids) == 2:
+                    # Convention: index 0 = YES, index 1 = NO
+                    tokens = [
+                        {"token_id": clob_ids[0], "outcome": "YES"},
+                        {"token_id": clob_ids[1], "outcome": "NO"},
+                    ]
+            except Exception:
+                return False
+
         if len(tokens) != 2:
             return False
 
@@ -233,7 +251,9 @@ class MarketDiscovery:
             return False
 
         # ── End-date window ──────────────────────────────────────────────────
-        end_date_raw: Optional[str] = raw.get("end_date_iso") or raw.get("end_date")
+        end_date_raw: Optional[str] = (
+            raw.get("endDate") or raw.get("end_date_iso") or raw.get("end_date")
+        )
         if not end_date_raw:
             return False
         try:
@@ -248,7 +268,7 @@ class MarketDiscovery:
             return False
 
         # ── 24-hour volume ───────────────────────────────────────────────────
-        volume = _coerce_float(raw.get("volume_24hr") or raw.get("volume_24h"))
+        volume = _coerce_float(raw.get("volume24hr") or raw.get("volume_24hr") or raw.get("volume_24h"))
         if volume < _MIN_VOLUME_24H or volume > _MAX_VOLUME_24H:
             return False
 
@@ -263,9 +283,21 @@ class MarketDiscovery:
         Raises KeyError / ValueError on unexpected structure so callers can
         log a warning and skip the market.
         """
-        condition_id: str = raw["condition_id"]
+        condition_id: str = (
+            raw.get("conditionId") or raw.get("condition_id") or raw["conditionId"]
+        )
 
-        tokens: List[Dict[str, Any]] = raw["tokens"]
+        # Build token list from tokens field or clobTokenIds (2026 API format).
+        tokens: List[Dict[str, Any]] = raw.get("tokens") or []
+        if not tokens:
+            import json as _json
+            clob_ids_raw = raw.get("clobTokenIds")
+            if clob_ids_raw:
+                clob_ids = _json.loads(clob_ids_raw) if isinstance(clob_ids_raw, str) else clob_ids_raw
+                tokens = [
+                    {"token_id": clob_ids[0], "outcome": "YES"},
+                    {"token_id": clob_ids[1], "outcome": "NO"},
+                ]
         yes_token_id = next(
             t["token_id"]
             for t in tokens
@@ -277,12 +309,21 @@ class MarketDiscovery:
             if str(t.get("outcome", "")).upper() == "NO"
         )
 
-        category: str = raw.get("category") or ""
+        category: str = (
+            raw.get("category") or raw.get("groupItemTitle") or raw.get("marketType") or ""
+        )
 
+        # 2026 API: fees in feeSchedule dict; fallback to fees dict or top-level fields.
+        fee_schedule: Dict[str, Any] = raw.get("feeSchedule") or {}
         fees_raw: Dict[str, Any] = raw.get("fees") or {}
-        fees_enabled: bool = bool(fees_raw) or bool(raw.get("fees_enabled", False))
-        maker_fee_rate = _coerce_float(fees_raw.get("maker_fee_rate", 0))
-        taker_fee_rate = _coerce_float(fees_raw.get("taker_fee_rate", 0))
+        taker_fee_rate = _coerce_float(
+            fee_schedule.get("rate")
+            or fees_raw.get("taker_fee_rate")
+            or raw.get("takerBaseFee", 0) / 10000  # basis points → fraction
+        )
+        # Maker rebate from feeSchedule.rebateRate (e.g. 0.25 = 25% of taker fee)
+        maker_fee_rate = 0.0  # Polymarket maker fee is zero
+        fees_enabled: bool = taker_fee_rate > 0
         fee_params = FeeParams(
             fees_enabled=fees_enabled,
             maker_fee_rate=maker_fee_rate,
@@ -296,10 +337,14 @@ class MarketDiscovery:
             raw.get("minimum_tick_size") or raw.get("tick_size") or 0
         )
 
-        end_date_raw: str = raw["end_date_iso"] if "end_date_iso" in raw else raw["end_date"]
+        end_date_raw: str = (
+            raw.get("endDate") or raw.get("end_date_iso") or raw.get("end_date") or ""
+        )
+        if not end_date_raw:
+            raise ValueError("no end_date field in market response")
         end_date = _parse_dt(end_date_raw)
 
-        volume_24h = _coerce_float(raw.get("volume_24hr") or raw.get("volume_24h") or 0)
+        volume_24h = _coerce_float(raw.get("volume24hr") or raw.get("volume_24hr") or raw.get("volume_24h") or 0)
 
         return Market(
             condition_id=condition_id,

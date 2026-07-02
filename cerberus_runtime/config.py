@@ -143,6 +143,42 @@ class AppConfig:
     max_spread_ticks: int = 2  # reject if best_bid-best_ask spread > N ticks
     min_levels_consumed: int = 2  # reject single-tick books (no depth)
 
+    # ── Sprint 5 — maker order strategy ──────────────────────────────────────
+    order_strategy: str = "FOK"
+    """Execution strategy: "FOK" (taker, immediate), "MAKER" (limit, rebate),
+    or "HYBRID" (try maker first, fall back to FOK on timeout)."""
+
+    maker_offset_ticks: int = 1
+    """How many ticks below best ask to post the limit order."""
+
+    maker_timeout_seconds: int = 45
+    """Cancel maker order if not filled within this many seconds."""
+
+    maker_min_fill_pct: Decimal = field(
+        default_factory=lambda: Decimal("0.70")  # accept ≥ 70% fill
+    )
+
+    maker_rebate_share: Decimal = field(
+        default_factory=lambda: Decimal("0.25")  # Polymarket default rebate 25%
+    )
+
+    # ── Sprint 5 — live trading credentials ──────────────────────────────────
+    polymarket_api_key: str = ""
+    """Polymarket CLOB API key (from POLYMARKET_API_KEY env var)."""
+
+    polymarket_api_secret: str = ""
+    """Polymarket CLOB API secret (from POLYMARKET_API_SECRET env var)."""
+
+    polymarket_api_passphrase: str = ""
+    """Polymarket CLOB API passphrase (from POLYMARKET_API_PASSPHRASE env var)."""
+
+    polymarket_private_key: str = ""
+    """Polygon wallet private key for signing orders (from POLYMARKET_PK env var).
+    Never log this field."""
+
+    polymarket_chain_id: int = 137
+    """Polygon chain ID (137 = mainnet, 80002 = Amoy testnet)."""
+
     # ── Risk parameters ───────────────────────────────────────────────────────
     dry_run_mode: bool = True
     allow_live_mode: bool = False
@@ -184,4 +220,14 @@ def get_app_config() -> AppConfig:
         market_cooldown_seconds=float(
             os.getenv("MARKET_COOLDOWN_SECONDS", "10.0")
         ),
+        order_strategy=os.getenv("ORDER_STRATEGY", "FOK"),
+        maker_offset_ticks=int(os.getenv("MAKER_OFFSET_TICKS", "1")),
+        maker_timeout_seconds=int(os.getenv("MAKER_TIMEOUT_SECONDS", "45")),
+        maker_min_fill_pct=Decimal(os.getenv("MAKER_MIN_FILL_PCT", "0.70")),
+        maker_rebate_share=Decimal(os.getenv("MAKER_REBATE_SHARE", "0.25")),
+        polymarket_api_key=os.getenv("POLYMARKET_API_KEY", ""),
+        polymarket_api_secret=os.getenv("POLYMARKET_API_SECRET", ""),
+        polymarket_api_passphrase=os.getenv("POLYMARKET_API_PASSPHRASE", ""),
+        polymarket_private_key=os.getenv("POLYMARKET_PK", ""),
+        polymarket_chain_id=int(os.getenv("POLYMARKET_CHAIN_ID", "137")),
     )

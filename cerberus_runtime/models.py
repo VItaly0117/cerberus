@@ -116,6 +116,7 @@ class LegQuote:
     fee_usdc: Decimal
     accumulated_cost: Decimal
     accumulated_tokens: Decimal
+    levels_consumed: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +149,8 @@ class ArbitrageSignal:
     edge_net: Decimal
     edge_net_pct: Decimal
     trade_notional_usdc: Decimal
+    order_strategy: str = "FOK"
+    """Execution strategy for this signal: "FOK" or "MAKER"."""
 
 
 # ``ArbitrageResult`` is a forward-compatible alias — Sprint 2 will extend this.
@@ -226,3 +229,30 @@ class Market:
     volume_24h: float
     active: bool = True
     closed: bool = False
+
+
+@dataclass
+class CorrelationSignal:
+    """Logical dependency violation detected between two related markets.
+
+    When P(dependent_event) > P(prerequisite_event) the pricing is logically
+    inconsistent — e.g. "candidate wins general" cannot be higher than
+    "candidate wins primary".  The spread between them is pure arb.
+
+    Attributes:
+        market_prereq:   Market that must happen first (should be priced higher).
+        market_dep:      Market logically dependent on prereq (currently priced too high).
+        prereq_best_ask: Best ask for YES on the prerequisite market.
+        dep_best_ask:    Best ask for YES on the dependent market.
+        spread_pct:      (dep_best_ask - prereq_best_ask) / prereq_best_ask — the arb size.
+        suggested_action: Human-readable description of the trade.
+        detected_at_ms:  Epoch milliseconds when signal was detected.
+    """
+
+    market_prereq: "Market"
+    market_dep: "Market"
+    prereq_best_ask: Decimal
+    dep_best_ask: Decimal
+    spread_pct: Decimal
+    suggested_action: str
+    detected_at_ms: int

@@ -60,6 +60,7 @@ try:
     from cerberus_runtime.risk import RiskManager, ArbitrageResult as RiskResult
     from cerberus_runtime.executor import Executor, ArbitrageResult as ExecResult
     from cerberus_runtime import metrics as _metrics
+    from cerberus_runtime.correlation import CorrelationScanner
     _IMPORTS_OK = True
     _IMPORT_ERROR: Optional[str] = None
 except Exception as exc:  # pragma: no cover
@@ -229,7 +230,16 @@ async def _core_loop(
             continue
 
         # ── Opportunity evaluation ────────────────────────────────────────
-        signal = _core.evaluate_opportunity(snapshot, app_config, fee_model)
+        if app_config.order_strategy == "MAKER":
+            signal = _core.evaluate_opportunity_maker(snapshot, app_config, fee_model)
+        elif app_config.order_strategy == "HYBRID":
+            # Try maker first (lower edge threshold, no fees); fall back to FOK.
+            signal = _core.evaluate_opportunity_maker(snapshot, app_config, fee_model)
+            if signal is None:
+                signal = _core.evaluate_opportunity(snapshot, app_config, fee_model)
+        else:
+            signal = _core.evaluate_opportunity(snapshot, app_config, fee_model)
+
         if signal is None:
             logger.debug("FILTERED [%s] edge below threshold", market_id)
             _metrics.record_reject("EDGE_BELOW_THRESHOLD", market_id=market_id)
@@ -414,23 +424,26 @@ def _build_report(
 async def run_paper(
     duration_hours: float = 72.0,
     max_signals: Optional[int] = None,
+    live_mode: bool = False,
 ) -> int:
-    """Run the full paper-trading loop.
+    """Run the full paper-trading loop (or live trading when live_mode=True).
 
     Returns:
         0 if median_edge_net_pct > 0, else 2.
     """
-    # ── Safety gate: abort if live mode is enabled ────────────────────────
-    allow_live = os.getenv("ALLOW_LIVE_MODE", "false").lower() == "true"
-    if allow_live:
-        logger.critical(
-            "ABORT: ALLOW_LIVE_MODE=true detected in paper mode. "
-            "Paper mode requires allow_live_mode=False."
-        )
-        return 1
+    if not live_mode:
+        # ── Safety gate: abort if live mode is enabled in env but not requested ─
+        allow_live = os.getenv("ALLOW_LIVE_MODE", "false").lower() == "true"
+        if allow_live:
+            logger.critical(
+                "ABORT: ALLOW_LIVE_MODE=true detected in paper mode. "
+                "Paper mode requires allow_live_mode=False."
+            )
+            return 1
 
     logger.info(
-        "Starting paper run — duration=%.1fh  max_signals=%s",
+        "Starting %s run — duration=%.1fh  max_signals=%s",
+        "LIVE" if live_mode else "paper",
         duration_hours,
         max_signals or "unlimited",
     )
@@ -438,9 +451,18 @@ async def run_paper(
     # ── Build components ──────────────────────────────────────────────────
     infra_cfg = get_config()
     app_config = get_app_config()
-    # Force paper-trading safety settings
-    app_config.dry_run_mode = True
-    app_config.allow_live_mode = False
+
+    if live_mode:
+        # Live mode requires explicit credentials
+        if not app_config.polymarket_private_key:
+            logger.critical("ABORT: POLYMARKET_PK not set. Cannot run live trading.")
+            return 1
+        app_config.dry_run_mode = False
+        app_config.allow_live_mode = True
+    else:
+        # Force paper-trading safety settings
+        app_config.dry_run_mode = True
+        app_config.allow_live_mode = False
 
     storage = Storage(infra_cfg.db_path)
     await storage.connect()
@@ -450,8 +472,9 @@ async def run_paper(
     executor = Executor(
         config=app_config,
         storage=storage,
-        dry_run_mode=True,
+        dry_run_mode=not live_mode,
     )
+    correlation_scanner = CorrelationScanner()
 
     candidate_queue: asyncio.Queue = asyncio.Queue()
     opportunity_queue: asyncio.Queue = asyncio.Queue()
@@ -486,6 +509,33 @@ async def run_paper(
         stop_event.set()
 
     # ── Run concurrently ──────────────────────────────────────────────────
+    async def _correlation_scan_loop() -> None:
+        """Periodically scan active markets for logical pricing violations."""
+        while not stop_event.is_set():
+            try:
+                active = await storage.get_active_markets()
+                if active:
+                    signals = correlation_scanner.scan(active)
+                    for sig in signals:
+                        await storage.insert_correlation_signal(
+                            market_id_prereq=sig.market_prereq.condition_id,
+                            market_id_dep=sig.market_dep.condition_id,
+                            prereq_best_ask=sig.prereq_best_ask,
+                            dep_best_ask=sig.dep_best_ask,
+                            spread_pct=sig.spread_pct,
+                            suggested_action=sig.suggested_action,
+                            ts_ms=sig.detected_at_ms,
+                        )
+                        if sig.spread_pct >= Decimal("0.03"):
+                            logger.info(
+                                "CORRELATION SIGNAL  spread=%.1f%%  %s",
+                                float(sig.spread_pct) * 100,
+                                sig.suggested_action,
+                            )
+            except Exception as exc:
+                logger.warning("correlation_scan_loop error: %s", exc)
+            await asyncio.sleep(600)  # scan every 10 minutes
+
     tasks = [
         asyncio.create_task(market_discovery.run(), name="discovery"),
         asyncio.create_task(watcher.run(), name="watcher"),
@@ -512,6 +562,7 @@ async def run_paper(
             name="metrics_flusher",
         ),
         asyncio.create_task(_duration_guard(), name="duration"),
+        asyncio.create_task(_correlation_scan_loop(), name="correlation"),
     ]
 
     try:
@@ -578,6 +629,11 @@ def main() -> int:
         action="store_true",
         help="Run paper-trading loop.",
     )
+    group.add_argument(
+        "--live",
+        action="store_true",
+        help="Run LIVE trading loop. Requires POLYMARKET_PK + ALLOW_LIVE_MODE=true in .env.",
+    )
     parser.add_argument(
         "--duration-hours",
         type=float,
@@ -597,6 +653,26 @@ def main() -> int:
 
     if args.preflight:
         return run_preflight()
+
+    if args.live:
+        confirmation = input(
+            "\n⚠️  LIVE TRADING MODE — real money will be spent.\n"
+            "Type 'YES I KNOW' to continue: "
+        ).strip()
+        if confirmation != "YES I KNOW":
+            print("Aborted.")
+            return 1
+        try:
+            return asyncio.run(
+                run_paper(
+                    duration_hours=args.duration_hours,
+                    max_signals=args.max_signals,
+                    live_mode=True,
+                )
+            )
+        except KeyboardInterrupt:
+            logger.info("Interrupted by user.")
+            return 0
 
     if args.paper:
         try:

@@ -23,6 +23,9 @@ import logging
 import time
 
 import httpx
+import ssl as _ssl
+
+import certifi
 import websockets
 
 from cerberus_runtime.models import Market
@@ -139,6 +142,9 @@ class Watcher:
                 await asyncio.sleep(self._backoff)
             else:
                 self._backoff = _RECONNECT_BASE_S
+                # No markets to watch — yield to the event loop so other tasks
+                # (market_discovery) can run and populate candidate_queue.
+                await asyncio.sleep(1)
 
     # ── Internals ─────────────────────────────────────────────────────────────
 
@@ -179,7 +185,8 @@ class Watcher:
             return  # nothing to watch — clean exit, back-off resets
 
         logger.info("Watcher: connecting to %s", self._ws_url)
-        async with websockets.connect(self._ws_url) as ws:
+        _ssl_ctx = _ssl.create_default_context(cafile=certifi.where())
+        async with websockets.connect(self._ws_url, ssl=_ssl_ctx, open_timeout=15) as ws:
             # ── Subscribe ────────────────────────────────────────────────────
             sub_msg = json.dumps(
                 {
@@ -189,10 +196,28 @@ class Watcher:
                 }
             )
             await ws.send(sub_msg)
-            logger.debug("Watcher: subscribed to %s", market_ids)
+            logger.info("Watcher: subscribed to %s markets", len(market_ids))
+
+            # ── Initial REST sync: populate books without waiting for WS events ──
+            for cid in list(self._active_markets.keys()):
+                await self._resync_from_rest(cid)
+                await self._emit_snapshot_if_fresh(cid)
 
             # ── Dispatch loop ─────────────────────────────────────────────────
-            async for raw_message in ws:
+            # Use timeout-based recv so we can REST-poll even when WS is quiet.
+            _REST_POLL_INTERVAL = 60  # seconds
+            _last_rest_poll = time.time()
+
+            while True:
+                try:
+                    raw_message = await asyncio.wait_for(ws.recv(), timeout=_REST_POLL_INTERVAL)
+                except asyncio.TimeoutError:
+                    # No WS event for 60s — refresh via REST
+                    logger.debug("Watcher: no WS events for %ds, REST polling", _REST_POLL_INTERVAL)
+                    for cid in list(self._active_markets.keys()):
+                        await self._resync_from_rest(cid)
+                        await self._emit_snapshot_if_fresh(cid)
+                    continue
                 # bug #3 fix: malformed JSON should not crash the watcher loop
                 try:
                     event = json.loads(raw_message)
@@ -255,6 +280,24 @@ class Watcher:
                     no_levels = len(snapshot.no_asks)
                     if yes_levels >= _MIN_ASK_LEVELS and no_levels >= _MIN_ASK_LEVELS:
                         await self.opportunity_queue.put(snapshot)
+
+    async def _emit_snapshot_if_fresh(self, condition_id: str) -> None:
+        """Emit a snapshot to opportunity_queue if the book is populated and fresh."""
+        book = self._books.get(condition_id)
+        market = self._active_markets.get(condition_id)
+        if book is None or market is None:
+            return
+        if book.is_fresh(self._book_max_age_ms):
+            snapshot = book.get_snapshot(
+                market_id=condition_id,
+                condition_id=condition_id,
+                yes_token_id=market.yes_token_id,
+                no_token_id=market.no_token_id,
+                fee_params=getattr(market, "fee_params", None),
+            )
+            if snapshot is not None:
+                await self.opportunity_queue.put(snapshot)
+                logger.debug("Watcher: emitted REST-synced snapshot for %s", condition_id)
 
     async def _resync_from_rest(self, market_id: str) -> None:
         """

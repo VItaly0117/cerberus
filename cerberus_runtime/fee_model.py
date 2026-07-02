@@ -22,9 +22,8 @@ _FEE_PRECISION = Decimal("0.000001")
 class FeeModel:
     """Computes trading fees from live market fee parameters.
 
-    The MVP treats every order as a taker order.  ``calculate_fee`` accepts
-    the ``order_side`` argument for forward-compatibility but always applies
-    the taker rate.
+    Supports both taker and maker order sides.  Maker orders on Polymarket
+    pay zero fee (maker_fee_rate=0) and earn USDC rebates separately.
     """
 
     # ------------------------------------------------------------------
@@ -37,36 +36,64 @@ class FeeModel:
         fee_params: Optional[FeeParams],
         order_side: str,
     ) -> Decimal:
-        """Calculate the taker fee for an order.
+        """Calculate the fee for an order.
 
         Args:
             notional_usdc: Trade notional in USDC as a ``Decimal``.
             fee_params:    Per-market fee config sourced from market data.
                            Passing ``None`` is treated the same as
                            ``fees_enabled=False``.
-            order_side:    ``"taker"`` or ``"maker"`` (only taker used in MVP).
+            order_side:    ``"taker"`` or ``"maker"``.
 
         Returns:
             Fee in USDC rounded to 6 decimal places.
-            Returns ``Decimal("0")`` when ``fee_params`` is ``None`` or
-            ``fees_enabled`` is ``False``.
+            Returns ``Decimal("0")`` when ``fee_params`` is ``None``,
+            ``fees_enabled`` is ``False``, or ``order_side == "maker"``
+            (Polymarket maker fee is zero).
 
         Raises:
-            ValueError: When ``fee_params.taker_fee_rate <= 0`` — this
-                        indicates corrupt or missing market data.
+            ValueError: When the applicable fee rate is negative.
         """
         if fee_params is None or not fee_params.fees_enabled:
             return Decimal("0")
 
-        # Convert float field from FeeParams (market-data boundary) to Decimal.
-        # Using str() avoids floating-point representation artefacts.
-        taker_rate: Decimal = Decimal(str(fee_params.taker_fee_rate))
+        if order_side == "maker":
+            # Polymarket maker orders pay zero fee; rate stored for reference only.
+            maker_rate: Decimal = Decimal(str(fee_params.maker_fee_rate))
+            if maker_rate < Decimal("0"):
+                raise ValueError("invalid maker fee rate from market data")
+            fee = notional_usdc * maker_rate
+            return fee.quantize(_FEE_PRECISION, rounding=ROUND_HALF_UP)
 
+        # taker path
+        taker_rate: Decimal = Decimal(str(fee_params.taker_fee_rate))
         if taker_rate <= Decimal("0"):
             raise ValueError("invalid fee rate from market data")
 
         fee = notional_usdc * taker_rate
         return fee.quantize(_FEE_PRECISION, rounding=ROUND_HALF_UP)
+
+    def estimate_maker_rebate(
+        self,
+        taker_fee_collected_usdc: Decimal,
+        rebate_share: Decimal = Decimal("0.25"),
+    ) -> Decimal:
+        """Estimate USDC maker rebate from collected taker fees.
+
+        Polymarket distributes 25% of collected taker fees daily to makers
+        (50% for the Finance category).  This is an estimate — actual rebate
+        depends on maker's share of daily liquidity provided.
+
+        Args:
+            taker_fee_collected_usdc: Taker fee collected on this fill.
+            rebate_share:             Fraction redistributed to makers (0.25 default).
+
+        Returns:
+            Estimated rebate in USDC.
+        """
+        return (taker_fee_collected_usdc * rebate_share).quantize(
+            _FEE_PRECISION, rounding=ROUND_HALF_UP
+        )
 
     def conservative_fallback_fee(self, notional_usdc: Decimal) -> Decimal:
         """Conservative 1 % fallback fee.

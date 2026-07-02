@@ -263,4 +263,114 @@ def evaluate_opportunity(
         edge_net=edge_net,
         edge_net_pct=edge_net_pct,
         trade_notional_usdc=config.trade_notional_usdc,
+        order_strategy=config.order_strategy,
+    )
+
+
+def evaluate_opportunity_maker(
+    snapshot: OrderBookSnapshot,
+    config,
+    fee_model: FeeModel,
+) -> Optional[ArbitrageSignal]:
+    """Evaluate a binary market snapshot for maker-order arbitrage.
+
+    Posts limit orders at (best_ask - maker_offset_ticks) on both legs.
+    Fees are zero for maker orders; edge requirement is lower as a result.
+
+    A maker signal is only emitted when the bid-ask spread is wide enough
+    to post a limit order with positive net edge.  The signal carries
+    ``order_strategy="MAKER"`` so the executor chooses the maker path.
+
+    Args:
+        snapshot: Live L2 order book snapshot for a binary market.
+        config:   :class:`~cerberus_runtime.config.AppConfig` instance.
+        fee_model: :class:`~cerberus_runtime.fee_model.FeeModel` instance.
+
+    Returns:
+        :class:`~cerberus_runtime.models.ArbitrageSignal` with
+        ``order_strategy="MAKER"`` if an opportunity exists, else ``None``.
+    """
+    if not snapshot.yes_asks or not snapshot.no_asks:
+        return None
+
+    tick = config.tick_size
+    offset = tick * config.maker_offset_ticks
+
+    # Post limit one tick below best ask — we become the new best bid.
+    yes_limit_price = snapshot.yes_asks[0].price - offset
+    no_limit_price = snapshot.no_asks[0].price - offset
+
+    if yes_limit_price <= Decimal("0") or no_limit_price <= Decimal("0"):
+        return None
+
+    # Depth check: require at least min_levels_consumed ask levels on each side.
+    if (
+        len(snapshot.yes_asks) < config.min_levels_consumed
+        or len(snapshot.no_asks) < config.min_levels_consumed
+    ):
+        return None
+
+    # For maker orders fees are zero — pass order_side="maker".
+    yes_fee = fee_model.calculate_fee(
+        config.trade_notional_usdc,
+        config.fee_params,
+        order_side="maker",
+    )
+    no_fee = fee_model.calculate_fee(
+        config.trade_notional_usdc,
+        config.fee_params,
+        order_side="maker",
+    )
+
+    # Compute gross edge: payout is always $1.00 per pair, cost is limit prices.
+    payout_per_pair = Decimal("1")
+    total_cost = (yes_limit_price + no_limit_price) * config.trade_notional_usdc
+    edge_gross = payout_per_pair * config.trade_notional_usdc - total_cost
+
+    # Maker orders have no fee drag — use slippage buffer only (no legged risk
+    # buffer since limit orders don't have timing risk between legs).
+    risk_haircut = config.trade_notional_usdc * config.slippage_buffer_pct
+    fees_total = yes_fee + no_fee
+    edge_net = edge_gross - fees_total - risk_haircut
+    edge_net_pct = edge_net / (config.trade_notional_usdc * Decimal("2"))
+
+    # Use a lower threshold for maker signals (no fee drag makes smaller spreads viable).
+    maker_min_edge_usd = config.min_net_edge_usd * Decimal("0.5")
+    maker_min_edge_pct = config.min_net_edge_pct * Decimal("0.5")
+
+    if edge_net < maker_min_edge_usd:
+        return None
+    if edge_net_pct < maker_min_edge_pct:
+        return None
+
+    # Build synthetic LegQuote objects representing the limit order intentions.
+    from cerberus_runtime.models import LegQuote  # avoid circular import at top level
+    yes_quote = LegQuote(
+        avg_price=yes_limit_price,
+        coverage_pct=Decimal("1"),
+        fee_usdc=yes_fee,
+        accumulated_cost=yes_limit_price * config.trade_notional_usdc,
+        accumulated_tokens=config.trade_notional_usdc,
+        levels_consumed=len(snapshot.yes_asks),
+    )
+    no_quote = LegQuote(
+        avg_price=no_limit_price,
+        coverage_pct=Decimal("1"),
+        fee_usdc=no_fee,
+        accumulated_cost=no_limit_price * config.trade_notional_usdc,
+        accumulated_tokens=config.trade_notional_usdc,
+        levels_consumed=len(snapshot.no_asks),
+    )
+
+    return ArbitrageSignal(
+        market_id=snapshot.market_id,
+        yes_quote=yes_quote,
+        no_quote=no_quote,
+        edge_gross=edge_gross,
+        fees_total=fees_total,
+        risk_haircut=risk_haircut,
+        edge_net=edge_net,
+        edge_net_pct=edge_net_pct,
+        trade_notional_usdc=config.trade_notional_usdc,
+        order_strategy="MAKER",
     )

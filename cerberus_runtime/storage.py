@@ -8,7 +8,7 @@ from __future__ import annotations
 import logging
 import statistics
 from decimal import Decimal
-from typing import Optional
+from typing import List, Optional
 
 import aiosqlite
 
@@ -48,6 +48,22 @@ CREATE TABLE IF NOT EXISTS paper_signals (
     result           TEXT NOT NULL,
     rejection_reason TEXT NOT NULL DEFAULT '',
     simulated_pnl    REAL NOT NULL DEFAULT 0.0,
+    order_strategy   TEXT NOT NULL DEFAULT 'FOK',
+    maker_rebate_usdc REAL NOT NULL DEFAULT 0.0,
+    recorded_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+"""
+
+_DDL_CORRELATION = """
+CREATE TABLE IF NOT EXISTS correlation_signals (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    market_id_prereq TEXT NOT NULL,
+    market_id_dep    TEXT NOT NULL,
+    prereq_best_ask  REAL NOT NULL,
+    dep_best_ask     REAL NOT NULL,
+    spread_pct       REAL NOT NULL,
+    suggested_action TEXT NOT NULL DEFAULT '',
+    ts_ms            INTEGER NOT NULL DEFAULT 0,
     recorded_at      TEXT NOT NULL DEFAULT (datetime('now'))
 );
 """
@@ -113,8 +129,17 @@ INSERT INTO paper_signals (
     market_id, condition_id, ts_ms,
     yes_best_ask, no_best_ask,
     edge_gross, fees_total, risk_haircut, edge_net, edge_net_pct,
-    result, rejection_reason, simulated_pnl
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    result, rejection_reason, simulated_pnl,
+    order_strategy, maker_rebate_usdc
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+"""
+
+_SQL_INSERT_CORRELATION = """
+INSERT INTO correlation_signals (
+    market_id_prereq, market_id_dep,
+    prereq_best_ask, dep_best_ask,
+    spread_pct, suggested_action, ts_ms
+) VALUES (?, ?, ?, ?, ?, ?, ?)
 """
 
 
@@ -145,7 +170,10 @@ class Storage:
         await self._conn.executescript(_DDL)
         await self._conn.executescript(_DDL_RESOLUTION)
         await self._conn.executescript(_DDL_RUNTIME_HEALTH)
+        await self._conn.executescript(_DDL_CORRELATION)
         await self._conn.commit()
+        # Sprint 5 migrations: add new columns to existing tables if absent.
+        await self._migrate_schema()
         logger.debug("Storage connected: %s", self.db_path)
 
     async def close(self) -> None:
@@ -190,6 +218,57 @@ class Storage:
         )
         await self._conn.commit()
         logger.info("Storage: marked market %s as closed.", condition_id)
+
+    async def _migrate_schema(self) -> None:
+        """Apply additive schema migrations for columns added after initial deploy."""
+        cursor = await self._conn.execute("PRAGMA table_info(paper_signals)")
+        existing_cols = {row[1] for row in await cursor.fetchall()}
+        if "order_strategy" not in existing_cols:
+            await self._conn.execute(
+                "ALTER TABLE paper_signals ADD COLUMN order_strategy TEXT NOT NULL DEFAULT 'FOK'"
+            )
+        if "maker_rebate_usdc" not in existing_cols:
+            await self._conn.execute(
+                "ALTER TABLE paper_signals ADD COLUMN maker_rebate_usdc REAL NOT NULL DEFAULT 0.0"
+            )
+        await self._conn.commit()
+
+    async def get_active_markets(self) -> List[Market]:
+        """Return all currently active, non-closed markets from storage."""
+        assert self._conn, "Call connect() before get_active_markets()"
+        from datetime import timezone
+        cursor = await self._conn.execute(
+            "SELECT condition_id, yes_token_id, no_token_id, category, "
+            "       fees_enabled, maker_fee_rate, taker_fee_rate, "
+            "       min_order_size, tick_size, end_date, volume_24h "
+            "FROM markets WHERE active = 1 AND closed = 0",
+        )
+        rows = await cursor.fetchall()
+        markets = []
+        for row in rows:
+            try:
+                from datetime import datetime
+                end_date = datetime.fromisoformat(row[9]).replace(tzinfo=timezone.utc)
+                markets.append(
+                    Market(
+                        condition_id=row[0],
+                        yes_token_id=row[1],
+                        no_token_id=row[2],
+                        category=row[3] or "",
+                        fee_params=FeeParams(
+                            fees_enabled=bool(row[4]),
+                            maker_fee_rate=row[5],
+                            taker_fee_rate=row[6],
+                        ),
+                        min_order_size=Decimal(str(row[7])),
+                        tick_size=Decimal(str(row[8])),
+                        end_date=end_date,
+                        volume_24h=row[10],
+                    )
+                )
+            except Exception:
+                pass
+        return markets
 
     # ------------------------------------------------------------------
     # paper_signals table
@@ -239,6 +318,7 @@ class Storage:
             condition_id = ""
             ts_ms = 0
 
+        _order_strategy = getattr(signal, "order_strategy", "FOK") if signal else "FOK"
         await self._conn.execute(
             _INSERT_PAPER_SIGNAL,
             (
@@ -255,6 +335,8 @@ class Storage:
                 result,
                 rejection_reason,
                 float(simulated_pnl),
+                _order_strategy,
+                0.0,  # maker_rebate_usdc (unknown at this call site)
             ),
         )
         await self._conn.commit()
@@ -268,6 +350,8 @@ class Storage:
         result: str,
         rejection_reason: str = "",
         simulated_pnl: Decimal = Decimal("0"),
+        order_strategy: str = "FOK",
+        maker_rebate_usdc: Decimal = Decimal("0"),
     ) -> None:
         """Variant with explicit market/snapshot metadata (used by cerberustest.py)."""
         assert self._conn, "Call connect() before insert_paper_signal_from_snapshot()"
@@ -280,6 +364,7 @@ class Storage:
             risk_haircut = float(signal.risk_haircut)
             edge_net     = float(signal.edge_net)
             edge_net_pct = float(signal.edge_net_pct)
+            order_strategy = getattr(signal, "order_strategy", order_strategy)
         else:
             yes_best = no_best = None
             edge_gross = fees_total = risk_haircut = edge_net = edge_net_pct = None
@@ -300,6 +385,34 @@ class Storage:
                 result,
                 rejection_reason,
                 float(simulated_pnl),
+                order_strategy,
+                float(maker_rebate_usdc),
+            ),
+        )
+        await self._conn.commit()
+
+    async def insert_correlation_signal(
+        self,
+        market_id_prereq: str,
+        market_id_dep: str,
+        prereq_best_ask: Decimal,
+        dep_best_ask: Decimal,
+        spread_pct: Decimal,
+        suggested_action: str,
+        ts_ms: int,
+    ) -> None:
+        """Persist a correlation/logical dependency violation signal."""
+        assert self._conn, "Call connect() before insert_correlation_signal()"
+        await self._conn.execute(
+            _SQL_INSERT_CORRELATION,
+            (
+                market_id_prereq,
+                market_id_dep,
+                float(prereq_best_ask),
+                float(dep_best_ask),
+                float(spread_pct),
+                suggested_action,
+                ts_ms,
             ),
         )
         await self._conn.commit()
