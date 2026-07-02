@@ -263,8 +263,14 @@ async def _core_loop(
                 maker_r = _maker_reason_box.get("reason", "edge_below_threshold")
                 fok_r = _reason_box.get("reason", "edge_below_threshold")
                 reason = f"hybrid_maker_{maker_r}_fok_{fok_r}"
+                # Prefer the FOK box's edge numbers (it ran last / is the
+                # fallback path); if FOK never ran (maker box has no reason
+                # key set because e.g. insufficient_depth), fall back to
+                # whatever the maker box computed.
+                rejected_edge = _reason_box if "edge_gross" in _reason_box else _maker_reason_box
             else:
                 reason = f"{reason_prefix}{_reason_box.get('reason', 'edge_below_threshold')}"
+                rejected_edge = _reason_box
             logger.debug("FILTERED [%s] reason=%s", market_id, reason)
             _metrics.record_reject(reason.upper(), market_id=market_id)
             await storage.insert_paper_signal_from_snapshot(
@@ -275,6 +281,7 @@ async def _core_loop(
                 result="FILTERED",
                 rejection_reason=reason,
                 simulated_pnl=Decimal("0"),
+                rejected_edge=rejected_edge or None,
             )
             _check_max_signals(evaluated, max_signals, stop_event)
             continue

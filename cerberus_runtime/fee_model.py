@@ -35,6 +35,7 @@ class FeeModel:
         notional_usdc: Decimal,
         fee_params: Optional[FeeParams],
         order_side: str,
+        avg_price: Optional[Decimal] = None,
     ) -> Decimal:
         """Calculate the fee for an order.
 
@@ -44,6 +45,13 @@ class FeeModel:
                            Passing ``None`` is treated the same as
                            ``fees_enabled=False``.
             order_side:    ``"taker"`` or ``"maker"``.
+            avg_price:     Average fill price for the leg (required for the
+                           taker path — Polymarket's exponent=1 CLOB fee
+                           curve is ``rate * min(price, 1-price) * size``,
+                           not a flat ``rate * notional``. It peaks at
+                           price=0.5 and shrinks toward 0 near price=0/1.
+                           Omitting it falls back to the flat (conservative,
+                           ~2x overstated near price=0.5) approximation.
 
         Returns:
             Fee in USDC rounded to 6 decimal places.
@@ -70,7 +78,11 @@ class FeeModel:
         if taker_rate <= Decimal("0"):
             raise ValueError("invalid fee rate from market data")
 
-        fee = notional_usdc * taker_rate
+        if avg_price is not None:
+            price_factor = min(avg_price, Decimal("1") - avg_price)
+            fee = notional_usdc * taker_rate * price_factor
+        else:
+            fee = notional_usdc * taker_rate
         return fee.quantize(_FEE_PRECISION, rounding=ROUND_HALF_UP)
 
     def estimate_maker_rebate(

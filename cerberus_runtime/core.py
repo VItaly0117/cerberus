@@ -132,7 +132,9 @@ def calculate_effective_leg(
         return None
 
     avg_price: Decimal = accumulated_cost / accumulated_tokens
-    fee_usdc: Decimal = fee_model.calculate_fee(accumulated_cost, fee_params, "taker")
+    fee_usdc: Decimal = fee_model.calculate_fee(
+        accumulated_cost, fee_params, "taker", avg_price=avg_price
+    )
 
     return LegQuote(
         avg_price=avg_price,
@@ -218,6 +220,34 @@ def evaluate_opportunity(
             _reason["reason"] = "insufficient_depth"
         return None
 
+    # Compute edge numbers as soon as both legs are quoted — BEFORE the gates
+    # below — so a rejected signal still carries edge_gross/edge_net_pct/etc
+    # in `_reason`. Without this, every FILTERED row loses the one number
+    # (how close it came to the threshold) needed to tell a near-miss from a
+    # structurally-negative market.
+    total_cost: Decimal = (
+        yes_quote.avg_price + no_quote.avg_price
+    ) * config.trade_notional_usdc
+
+    edge_gross: Decimal = payout_per_pair * config.trade_notional_usdc - total_cost
+    fees_total: Decimal = yes_quote.fee_usdc + no_quote.fee_usdc
+    risk_haircut: Decimal = config.trade_notional_usdc * (
+        config.slippage_buffer_pct + config.legged_risk_buffer_pct
+    )
+    edge_net: Decimal = edge_gross - fees_total - risk_haircut
+    edge_net_pct: Decimal = edge_net / (config.trade_notional_usdc * Decimal("2"))
+
+    if _reason is not None:
+        _reason.update({
+            "yes_best_ask": yes_quote.avg_price,
+            "no_best_ask": no_quote.avg_price,
+            "edge_gross": edge_gross,
+            "fees_total": fees_total,
+            "risk_haircut": risk_haircut,
+            "edge_net": edge_net,
+            "edge_net_pct": edge_net_pct,
+        })
+
     # ── Sprint 6 — depth gate (min_levels_consumed) ──────────────────────────
     # Reject single-tick books to avoid high realised slippage on illiquid
     # markets. We count distinct non-zero levels in both asks lists.
@@ -234,18 +264,6 @@ def evaluate_opportunity(
             if _reason is not None:
                 _reason["reason"] = "min_levels_gate"
             return None
-
-    total_cost: Decimal = (
-        yes_quote.avg_price + no_quote.avg_price
-    ) * config.trade_notional_usdc
-
-    edge_gross: Decimal = payout_per_pair * config.trade_notional_usdc - total_cost
-    fees_total: Decimal = yes_quote.fee_usdc + no_quote.fee_usdc
-    risk_haircut: Decimal = config.trade_notional_usdc * (
-        config.slippage_buffer_pct + config.legged_risk_buffer_pct
-    )
-    edge_net: Decimal = edge_gross - fees_total - risk_haircut
-    edge_net_pct: Decimal = edge_net / (config.trade_notional_usdc * Decimal("2"))
 
     if edge_net < config.min_net_edge_usd:
         logger.debug(
@@ -354,6 +372,17 @@ def evaluate_opportunity_maker(
     fees_total = yes_fee + no_fee
     edge_net = edge_gross - fees_total - risk_haircut
     edge_net_pct = edge_net / (config.trade_notional_usdc * Decimal("2"))
+
+    if _reason is not None:
+        _reason.update({
+            "yes_best_ask": yes_limit_price,
+            "no_best_ask": no_limit_price,
+            "edge_gross": edge_gross,
+            "fees_total": fees_total,
+            "risk_haircut": risk_haircut,
+            "edge_net": edge_net,
+            "edge_net_pct": edge_net_pct,
+        })
 
     # Use a lower threshold for maker signals (no fee drag makes smaller spreads viable).
     maker_min_edge_usd = config.min_net_edge_usd * Decimal("0.5")

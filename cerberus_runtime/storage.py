@@ -352,8 +352,20 @@ class Storage:
         simulated_pnl: Decimal = Decimal("0"),
         order_strategy: str = "FOK",
         maker_rebate_usdc: Decimal = Decimal("0"),
+        rejected_edge: Optional[dict] = None,
     ) -> None:
-        """Variant with explicit market/snapshot metadata (used by cerberustest.py)."""
+        """Variant with explicit market/snapshot metadata (used by cerberustest.py).
+
+        Args:
+            rejected_edge: When ``signal`` is ``None`` (BLOCKED/FILTERED row),
+                an optional dict of the edge numbers evaluate_opportunity[_maker]
+                had already computed before rejecting (keys: yes_best_ask,
+                no_best_ask, edge_gross, fees_total, risk_haircut, edge_net,
+                edge_net_pct — see core.py's ``_reason`` out-param). Without
+                this, rejected rows would have no numeric edge data at all,
+                making it impossible to tell a near-miss from a structurally
+                hopeless signal.
+        """
         assert self._conn, "Call connect() before insert_paper_signal_from_snapshot()"
 
         if signal is not None:
@@ -365,6 +377,14 @@ class Storage:
             edge_net     = float(signal.edge_net)
             edge_net_pct = float(signal.edge_net_pct)
             order_strategy = getattr(signal, "order_strategy", order_strategy)
+        elif rejected_edge:
+            yes_best     = float(rejected_edge["yes_best_ask"]) if "yes_best_ask" in rejected_edge else None
+            no_best      = float(rejected_edge["no_best_ask"]) if "no_best_ask" in rejected_edge else None
+            edge_gross   = float(rejected_edge["edge_gross"]) if "edge_gross" in rejected_edge else None
+            fees_total   = float(rejected_edge["fees_total"]) if "fees_total" in rejected_edge else None
+            risk_haircut = float(rejected_edge["risk_haircut"]) if "risk_haircut" in rejected_edge else None
+            edge_net     = float(rejected_edge["edge_net"]) if "edge_net" in rejected_edge else None
+            edge_net_pct = float(rejected_edge["edge_net_pct"]) if "edge_net_pct" in rejected_edge else None
         else:
             yes_best = no_best = None
             edge_gross = fees_total = risk_haircut = edge_net = edge_net_pct = None
