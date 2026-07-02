@@ -152,6 +152,7 @@ def evaluate_opportunity(
     snapshot: OrderBookSnapshot,
     config: AppConfig,
     fee_model: FeeModel,
+    _reason: Optional[dict] = None,
 ) -> Optional[ArbitrageSignal]:
     """Evaluate whether a binary market snapshot presents a net-positive arb.
 
@@ -182,6 +183,11 @@ def evaluate_opportunity(
         snapshot:  Current order book snapshot.
         config:    :class:`AppConfig` with notional, thresholds, fee params.
         fee_model: :class:`FeeModel` instance.
+        _reason:   Optional mutable dict; if given, ``_reason["reason"]`` is set
+                   to a machine-readable cause when ``None`` is returned
+                   (``"insufficient_depth"``, ``"min_levels_gate"``, or
+                   ``"edge_below_threshold"``). Callers that don't care about
+                   the cause can omit this.
 
     Returns:
         :class:`ArbitrageSignal` when edge exceeds all thresholds; ``None``
@@ -208,6 +214,8 @@ def evaluate_opportunity(
     )
 
     if yes_quote is None or no_quote is None:
+        if _reason is not None:
+            _reason["reason"] = "insufficient_depth"
         return None
 
     # ── Sprint 6 — depth gate (min_levels_consumed) ──────────────────────────
@@ -223,6 +231,8 @@ def evaluate_opportunity(
                 "no_levels=%d, required=%d)",
                 snapshot.market_id, yes_count, no_count, min_levels,
             )
+            if _reason is not None:
+                _reason["reason"] = "min_levels_gate"
             return None
 
     total_cost: Decimal = (
@@ -243,6 +253,8 @@ def evaluate_opportunity(
             edge_net,
             config.min_net_edge_usd,
         )
+        if _reason is not None:
+            _reason["reason"] = "edge_below_threshold"
         return None
 
     if edge_net_pct < config.min_net_edge_pct:
@@ -251,6 +263,8 @@ def evaluate_opportunity(
             edge_net_pct,
             config.min_net_edge_pct,
         )
+        if _reason is not None:
+            _reason["reason"] = "edge_below_threshold"
         return None
 
     return ArbitrageSignal(
@@ -271,6 +285,7 @@ def evaluate_opportunity_maker(
     snapshot: OrderBookSnapshot,
     config,
     fee_model: FeeModel,
+    _reason: Optional[dict] = None,
 ) -> Optional[ArbitrageSignal]:
     """Evaluate a binary market snapshot for maker-order arbitrage.
 
@@ -291,6 +306,8 @@ def evaluate_opportunity_maker(
         ``order_strategy="MAKER"`` if an opportunity exists, else ``None``.
     """
     if not snapshot.yes_asks or not snapshot.no_asks:
+        if _reason is not None:
+            _reason["reason"] = "insufficient_depth"
         return None
 
     tick = config.tick_size
@@ -301,6 +318,8 @@ def evaluate_opportunity_maker(
     no_limit_price = snapshot.no_asks[0].price - offset
 
     if yes_limit_price <= Decimal("0") or no_limit_price <= Decimal("0"):
+        if _reason is not None:
+            _reason["reason"] = "invalid_limit_price"
         return None
 
     # Depth check: require at least min_levels_consumed ask levels on each side.
@@ -308,6 +327,8 @@ def evaluate_opportunity_maker(
         len(snapshot.yes_asks) < config.min_levels_consumed
         or len(snapshot.no_asks) < config.min_levels_consumed
     ):
+        if _reason is not None:
+            _reason["reason"] = "min_levels_gate"
         return None
 
     # For maker orders fees are zero — pass order_side="maker".
@@ -339,8 +360,12 @@ def evaluate_opportunity_maker(
     maker_min_edge_pct = config.min_net_edge_pct * Decimal("0.5")
 
     if edge_net < maker_min_edge_usd:
+        if _reason is not None:
+            _reason["reason"] = "edge_below_threshold"
         return None
     if edge_net_pct < maker_min_edge_pct:
+        if _reason is not None:
+            _reason["reason"] = "edge_below_threshold"
         return None
 
     # Build synthetic LegQuote objects representing the limit order intentions.

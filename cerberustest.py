@@ -46,6 +46,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger("cerberustest")
 
+# Load .env into the process environment before any get_app_config()/get_config()
+# call reads os.getenv() — previously .env was never loaded, so every threshold
+# in it was silently ignored in favor of hardcoded defaults.
+from dotenv import load_dotenv  # noqa: E402
+
+load_dotenv()
+
 # ---------------------------------------------------------------------------
 # Runtime imports (deferred so --preflight can report import failures)
 # ---------------------------------------------------------------------------
@@ -230,26 +237,43 @@ async def _core_loop(
             continue
 
         # ── Opportunity evaluation ────────────────────────────────────────
+        # _reason_box captures *why* evaluate_opportunity[_maker] returned None
+        # (insufficient_depth / min_levels_gate / edge_below_threshold /
+        # invalid_limit_price) so FILTERED rows carry more than one bucket.
+        # Plain FOK strategy keeps the bare reason string (no prefix) for
+        # backward compatibility with existing consumers/tests. HYBRID keeps
+        # BOTH the maker attempt's reason and the fok fallback's reason so a
+        # double-miss doesn't erase evidence that the maker path ran at all.
+        _reason_box: dict = {}
+        _maker_reason_box: dict = {}
+        reason_prefix = ""
         if app_config.order_strategy == "MAKER":
-            signal = _core.evaluate_opportunity_maker(snapshot, app_config, fee_model)
+            signal = _core.evaluate_opportunity_maker(snapshot, app_config, fee_model, _reason_box)
+            reason_prefix = "maker_"
         elif app_config.order_strategy == "HYBRID":
             # Try maker first (lower edge threshold, no fees); fall back to FOK.
-            signal = _core.evaluate_opportunity_maker(snapshot, app_config, fee_model)
+            signal = _core.evaluate_opportunity_maker(snapshot, app_config, fee_model, _maker_reason_box)
             if signal is None:
-                signal = _core.evaluate_opportunity(snapshot, app_config, fee_model)
+                signal = _core.evaluate_opportunity(snapshot, app_config, fee_model, _reason_box)
         else:
-            signal = _core.evaluate_opportunity(snapshot, app_config, fee_model)
+            signal = _core.evaluate_opportunity(snapshot, app_config, fee_model, _reason_box)
 
         if signal is None:
-            logger.debug("FILTERED [%s] edge below threshold", market_id)
-            _metrics.record_reject("EDGE_BELOW_THRESHOLD", market_id=market_id)
+            if app_config.order_strategy == "HYBRID":
+                maker_r = _maker_reason_box.get("reason", "edge_below_threshold")
+                fok_r = _reason_box.get("reason", "edge_below_threshold")
+                reason = f"hybrid_maker_{maker_r}_fok_{fok_r}"
+            else:
+                reason = f"{reason_prefix}{_reason_box.get('reason', 'edge_below_threshold')}"
+            logger.debug("FILTERED [%s] reason=%s", market_id, reason)
+            _metrics.record_reject(reason.upper(), market_id=market_id)
             await storage.insert_paper_signal_from_snapshot(
                 market_id=market_id,
                 condition_id=condition_id,
                 ts_ms=ts_ms,
                 signal=None,
                 result="FILTERED",
-                rejection_reason="edge_below_threshold",
+                rejection_reason=reason,
                 simulated_pnl=Decimal("0"),
             )
             _check_max_signals(evaluated, max_signals, stop_event)

@@ -1,7 +1,10 @@
 artifacts/paper/run.log
+artifacts/paper/*.log
 .env
 .launch.sh
 __pycache__/
 *.pyc
 cerberus.db
 *.db
+venv/
+paper_run*.log
