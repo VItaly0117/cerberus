@@ -32,10 +32,16 @@ _RESCAN_INTERVAL: int = 300          # seconds between full scans
 _REQUEST_TIMEOUT: float = 10.0       # HTTP timeout (seconds)
 _BACKOFF_BASE: int = 2               # first back-off delay on 429 (seconds)
 _BACKOFF_MAX: int = 64               # ceiling for exponential back-off
-_MIN_VOLUME_24H: float = 200.0       # USDC — lowered for 2026 market structure
+_MIN_VOLUME_24H: float = 1_000.0     # USDC — floor raised from 200: sub-$1k/24h markets
+                                     # have too little depth for $50 notional legs without
+                                     # crossing multiple price levels (see min_levels_gate
+                                     # rejections in core.py), so they were dead weight.
 _MAX_VOLUME_24H: float = 2_000_000.0  # USDC — raised: Polymarket $26B/mo in 2026
 _MIN_DAYS_TO_END: int = 1    # lowered: include markets resolving tomorrow
 _MAX_DAYS_TO_END: int = 90   # raised: include longer-dated markets
+_MAX_DISCOVERY_PAGES: int = 20  # 20 * 100 = 2 000 markets/scan ceiling — plenty
+                                # to fill MAX_OPEN_MARKETS=40+ after filtering,
+                                # bounded so one scan cycle can't run away.
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -139,64 +145,95 @@ class MarketDiscovery:
         """
         GET {gamma_host}/markets?active=true&closed=false&neg_risk=false
 
-        Handles:
+        Paginates via limit/offset — Gamma caps each page at 100 rows
+        regardless of the requested limit, and without offset the API
+        silently returns only its first page. A single unpaginated call
+        was capping candidate discovery at ~20-100 markets, making
+        MAX_OPEN_MARKETS values above that unreachable. Pages are walked
+        until an empty page or _MAX_DISCOVERY_PAGES is hit.
+
+        Handles per page:
           - HTTP 429 → exponential back-off (2, 4, 8, … 64 s), logs runtime_event
-          - timeout > 10 s → log error, return None (skip cycle)
-          - ConnectError → log critical, sleep 60 s, return None (skip cycle)
-          - Other HTTP errors → log error, return None
+          - timeout > 10 s → log error, stop paginating, return pages collected so far
+          - ConnectError → log critical, sleep 60 s, return pages collected so far
+          - Other HTTP errors → log error, return pages collected so far
         """
         url = f"{self.config.gamma_host}/markets"
-        params = {"active": "true", "closed": "false", "neg_risk": "false"}
-        backoff: int = _BACKOFF_BASE
+        page_size = 100
+        all_markets: List[Dict[str, Any]] = []
 
-        while True:
-            try:
-                async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT) as client:
-                    response = await client.get(url, params=params)
+        for page in range(_MAX_DISCOVERY_PAGES):
+            params = {
+                "active": "true",
+                "closed": "false",
+                "neg_risk": "false",
+                "limit": page_size,
+                "offset": page * page_size,
+            }
+            backoff: int = _BACKOFF_BASE
 
-                if response.status_code == 429:
-                    logger.warning(
-                        "Gamma API rate-limited (HTTP 429). Back-off %ds before retry.",
-                        backoff,
+            while True:
+                try:
+                    async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT) as client:
+                        response = await client.get(url, params=params)
+
+                    if response.status_code == 429:
+                        logger.warning(
+                            "Gamma API rate-limited (HTTP 429). Back-off %ds before retry.",
+                            backoff,
+                        )
+                        await self._log_runtime_event(
+                            "rate_limit_backoff", {"backoff_secs": backoff, "url": url}
+                        )
+                        await asyncio.sleep(backoff)
+                        backoff = min(backoff * 2, _BACKOFF_MAX)
+                        continue  # retry this page
+
+                    response.raise_for_status()
+                    data = response.json()
+
+                    # Gamma may wrap the list in a top-level object
+                    if isinstance(data, dict):
+                        data = data.get("markets") or data.get("data") or []
+
+                    break  # page fetched successfully, exit retry loop
+
+                except httpx.TimeoutException:
+                    logger.error(
+                        "Gamma API request timed out (>%.0fs) on page %d. "
+                        "Using %d markets collected so far.",
+                        _REQUEST_TIMEOUT,
+                        page,
+                        len(all_markets),
                     )
-                    await self._log_runtime_event(
-                        "rate_limit_backoff", {"backoff_secs": backoff, "url": url}
+                    return all_markets or None
+
+                except httpx.ConnectError:
+                    logger.critical(
+                        "Gamma host '%s' is unreachable. Sleeping 60s before next cycle.",
+                        self.config.gamma_host,
                     )
-                    await asyncio.sleep(backoff)
-                    backoff = min(backoff * 2, _BACKOFF_MAX)
-                    continue  # retry the request
+                    await asyncio.sleep(60)
+                    return all_markets or None
 
-                response.raise_for_status()
-                data = response.json()
+                except httpx.HTTPStatusError as exc:
+                    logger.error(
+                        "Gamma API returned HTTP %s on page %d. "
+                        "Using %d markets collected so far. Detail: %s",
+                        exc.response.status_code,
+                        page,
+                        len(all_markets),
+                        exc,
+                    )
+                    return all_markets or None
 
-                # Gamma may wrap the list in a top-level object
-                if isinstance(data, dict):
-                    data = data.get("markets") or data.get("data") or []
+            if not data:
+                break  # no more pages
+            all_markets.extend(data)
+            if len(data) < page_size:
+                break  # last page (short page)
 
-                return data  # type: ignore[return-value]
-
-            except httpx.TimeoutException:
-                logger.error(
-                    "Gamma API request timed out (>%.0fs). Skipping scan cycle.",
-                    _REQUEST_TIMEOUT,
-                )
-                return None
-
-            except httpx.ConnectError:
-                logger.critical(
-                    "Gamma host '%s' is unreachable. Sleeping 60s before next cycle.",
-                    self.config.gamma_host,
-                )
-                await asyncio.sleep(60)
-                return None
-
-            except httpx.HTTPStatusError as exc:
-                logger.error(
-                    "Gamma API returned HTTP %s. Skipping scan cycle. Detail: %s",
-                    exc.response.status_code,
-                    exc,
-                )
-                return None
+        return all_markets
 
     # ── Filtering ─────────────────────────────────────────────────────────────
 
@@ -210,7 +247,7 @@ class MarketDiscovery:
           ✓ exactly 2 outcome tokens (binary market)
           ✓ tokens include both a YES and a NO token (each with a non-empty id)
           ✓ end_date in (now + 3d, now + 30d)
-          ✓ volume_24h in [1 000, 15 000] USDC
+          ✓ volume_24h in [1 000, 2 000 000] USDC
         """
         # ── Basic flags ──────────────────────────────────────────────────────
         if not raw.get("active", False):
