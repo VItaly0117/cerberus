@@ -127,28 +127,43 @@ def fmt_stats(values: list[float]) -> str:
 # ---------------------------------------------------------------------------
 
 def process_status(pid: int | None) -> str:
+    is_windows = os.name == "nt"
     try:
         if pid is not None:
-            out = subprocess.run(
-                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
-                capture_output=True, text=True, timeout=5,
-            ).stdout.strip()
-            if out and out.upper().startswith('"PYTHON'):
-                return f"ALIVE  (pid={pid})"
-            return f"NOT FOUND  (pid={pid} - process exited or wrong pid)"
+            if is_windows:
+                out = subprocess.run(
+                    ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                    capture_output=True, text=True, timeout=5,
+                ).stdout.strip()
+                if out and out.upper().startswith('"PYTHON'):
+                    return f"ALIVE  (pid={pid})"
+                return f"NOT FOUND  (pid={pid} - process exited or wrong pid)"
+            alive = subprocess.run(
+                ["kill", "-0", str(pid)], capture_output=True, timeout=5,
+            ).returncode == 0
+            return f"ALIVE  (pid={pid})" if alive else f"NOT FOUND  (pid={pid} - process exited or wrong pid)"
         else:
+            if is_windows:
+                out = subprocess.run(
+                    ["tasklist", "/FI", "IMAGENAME eq python.exe", "/FO", "CSV", "/NH"],
+                    capture_output=True, text=True, timeout=5,
+                ).stdout.strip()
+                if not out or "INFO:" in out:
+                    return "NO python.exe PROCESSES RUNNING"
+                pids = []
+                for line in out.splitlines():
+                    parts = [c.strip('"') for c in line.split('","')]
+                    if len(parts) >= 2:
+                        pids.append(parts[1])
+                return f"{len(pids)} python.exe process(es) running: pid(s)={', '.join(pids)}  (pass --pid to pin down which one)"
             out = subprocess.run(
-                ["tasklist", "/FI", "IMAGENAME eq python.exe", "/FO", "CSV", "/NH"],
+                ["pgrep", "-f", "cerberustest.py"],
                 capture_output=True, text=True, timeout=5,
             ).stdout.strip()
-            if not out or "INFO:" in out:
-                return "NO python.exe PROCESSES RUNNING"
-            pids = []
-            for line in out.splitlines():
-                parts = [c.strip('"') for c in line.split('","')]
-                if len(parts) >= 2:
-                    pids.append(parts[1])
-            return f"{len(pids)} python.exe process(es) running: pid(s)={', '.join(pids)}  (pass --pid to pin down which one)"
+            pids = [p for p in out.splitlines() if p]
+            if not pids:
+                return "NO cerberustest.py PROCESSES RUNNING"
+            return f"{len(pids)} cerberustest.py process(es) running: pid(s)={', '.join(pids)}  (pass --pid to pin down which one)"
     except Exception as exc:
         return f"(could not check: {exc})"
 
