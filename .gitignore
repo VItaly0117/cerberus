@@ -8,4 +8,6 @@ cerberus.db
 *.db
 venv/
 paper_run*.log
+resolver_run*.log
 artifacts/paper/.monitor_state.json
+artifacts/resolver/
