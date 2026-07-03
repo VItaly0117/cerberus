@@ -1,0 +1,87 @@
+{
+  "total_paper_signals": 5795,
+  "result_breakdown": {
+    "FILTERED": 5795
+  },
+  "rejection_reason_breakdown": [
+    {
+      "reason": "hybrid_maker_edge_below_threshold_fok_edge_below_threshold",
+      "count": 5600,
+      "avg_edge_net_pct": -0.014711891803469017,
+      "min_edge_net_pct": -0.08606265035746959,
+      "max_edge_net_pct": -0.0045
+    },
+    {
+      "reason": "hybrid_maker_invalid_limit_price_fok_min_levels_gate",
+      "count": 195,
+      "avg_edge_net_pct": -0.006055398030920475,
+      "min_edge_net_pct": -0.006193723623956182,
+      "max_edge_net_pct": -0.006037856357330175
+    }
+  ],
+  "overall_edge_net_pct": {
+    "avg": -0.014420603402149436,
+    "min": -0.08606265035746959,
+    "max": -0.0045
+  },
+  "per_market": [
+    {
+      "market_id": "0xe4fcc10c0ee2b1c0f6fd9bb8acdf8f009d38cfbf5c614a60e94696fa9da6c209",
+      "count": 906,
+      "avg_edge_net_pct": -0.013731449243394226,
+      "max_edge_net_pct": -0.01043211100099108
+    },
+    {
+      "market_id": "0x4204709db9aa84a9f39649954ef58d35065fd3ba21f16c0c75fdc1b601ea03f0",
+      "count": 906,
+      "avg_edge_net_pct": -0.03524397660723106,
+      "max_edge_net_pct": -0.009
+    },
+    {
+      "market_id": "0xbb57ccf5853a85487bc3d83d04d669310d28c6c810758953b9d9b91d1aee89d2",
+      "count": 905,
+      "avg_edge_net_pct": -0.0045,
+      "max_edge_net_pct": -0.0045
+    },
+    {
+      "market_id": "0x32b09f6390252b37d674501527e709016d55581b2c1e544bd4b8167f5f732f4c",
+      "count": 901,
+      "avg_edge_net_pct": -0.009,
+      "max_edge_net_pct": -0.009
+    },
+    {
+      "market_id": "0x1fad72fae204143ff1c3035e99e7c0f65ea8d5cd9bd1070987bd1a3316f772be",
+      "count": 707,
+      "avg_edge_net_pct": -0.01788693372342246,
+      "max_edge_net_pct": -0.013640575079872205
+    },
+    {
+      "market_id": "0x7b49b9bacb5f435bc10f3b100ff59e2fdd346f7f92a9001881bc9825a0af0f11",
+      "count": 700,
+      "avg_edge_net_pct": -0.009,
+      "max_edge_net_pct": -0.009
+    },
+    {
+      "market_id": "0x0ea8005efbc460378340a2f28a6d97b0d1d9d9d7fba4d16f529b8a415dca77a2",
+      "count": 575,
+      "avg_edge_net_pct": -0.011977906324000514,
+      "max_edge_net_pct": -0.009
+    },
+    {
+      "market_id": "0xfcde7eec764a4e3dd2c43e92efec3cd23d8df64cceff357914a31d2c7820a6ea",
+      "count": 195,
+      "avg_edge_net_pct": -0.006055398030920475,
+      "max_edge_net_pct": -0.006037856357330175
+    }
+  ],
+  "distinct_markets": 8,
+  "hourly_attempt_cap_mentions": 0,
+  "recorded_at_range_utc": {
+    "min": "2026-07-02 18:59:08",
+    "max": "2026-07-03 22:11:31"
+  },
+  "resolution_signals_count": 0,
+  "resolution_signals_rows": [],
+  "correlation_signals_count": 0,
+  "correlation_signals_rows": []
+}

@@ -1,5 +1,66 @@
 # Profitability judge panel — 2026-07-02
 
+> ## ⛔ CLOSED — 2026-07-04: YES+NO arbitrage confirmed structurally unprofitable
+>
+> **Conclusion:** YES+NO (taker/maker/hybrid) arbitrage on Cerberus, under
+> Polymarket's fee structure introduced 2026-03-30, is **not profitable** on
+> the current set of liquid, near-term, binary markets. This is a closed
+> question — do not re-litigate it from scratch; re-open only if one of the
+> invalidating conditions below actually changes.
+>
+> **Basis for this conclusion** (both bugs below were fixed *before* this
+> data was collected — this is not the pre-fix false-negative from earlier
+> in the investigation):
+> - **5795 paper_signals**, spanning **2026-07-02 18:59 UTC → 2026-07-03
+>   22:11 UTC** (~27h, continuous day+night, post-fix clean run)
+> - **8 distinct markets** — the full liquid/near-term/binary universe
+>   available under current filters (volume_24h ∈ [$1000, $2M], end_date ∈
+>   [1, 90] days, neg_risk=false) at the time of the run
+> - **100% FILTERED** — 0 SUCCESS, 0 LEGGED_RISK, 0 BLOCKED_BY_RISK
+> - `edge_net_pct`: **mean -1.44%**, min -8.6%, **max -0.45%** — the single
+>   least-negative observation across all 5795 rows, over every market and
+>   every hour of the day, never crossed zero, let alone the 1.75%
+>   (MAKER)/3.5% (FOK) entry threshold
+> - Per-market breakdown: all 8 markets negative on average, best single
+>   market ceiling -0.45%, worst -3.47% average
+> - Full raw DB + logs archived at
+>   `artifacts/paper/final_20260704/` (git-ignored — kept locally, not
+>   pushed; see `final_aggregates_20260704.json` there for the complete
+>   machine-readable numbers, committed to git)
+>
+> **What would invalidate this conclusion (re-open triggers):**
+> 1. Polymarket changes its fee schedule (current: taker exponent=1,
+>    `rate=0.03-0.05 × min(price,1-price)`, maker=0, 25% rebate — introduced
+>    2026-03-30). A meaningfully lower taker fee could flip FOK/HYBRID
+>    positive.
+> 2. The liquid/near-term binary market universe grows materially beyond
+>    ~8 (i.e. YES+NO ask-sum spreads widen due to more market fragmentation
+>    or less market-maker competition).
+> 3. A different, currently-unexplored execution tactic emerges (e.g.
+>    cross-venue YES+NO arb against another prediction market with the same
+>    event, which this analysis never touched).
+>
+> **What is NOT an invalidating condition:** waiting longer on the same 8
+> markets. The edge distribution was stable across a full day/night cycle;
+> more of the same is not expected to change the conclusion (see Angle 5's
+> own caveat below re: the originally-recommended 1-2 week window — that
+> recommendation was about reaching the *bar of rigor* for a live-money
+> decision, not about the direction of the result, which was already this
+> consistent at the 24h mark).
+>
+> **Code status:** the YES+NO strategy implementation (core.py,
+> fee_model.py, executor.py, watcher.py, market_discovery.py) is left
+> in place, untouched, as working/tested infrastructure — not deleted.
+> It is simply not being run until an invalidating condition above holds.
+>
+> Next direction (not decided as of this closure — user is taking time to
+> think): Resolution Arbitrage (module exists, 0 signals in 27h — needs a
+> wider search window/scope before its own verdict), neg_risk multi-outcome
+> arb (panel-vetoed as a large rewrite, would need its own scoped project),
+> or a different focus entirely (Sentinel).
+
+---
+
 5 independent agent analyses (market-structure, quant/fee-model, execution-
 engineering, capital-preservation, empirical-rigor) + 1 judge synthesis,
 run via the Workflow tool, evaluating how Cerberus should reach real
