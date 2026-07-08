@@ -112,6 +112,51 @@ def fetch_summary(conn: sqlite3.Connection, since_clause: str = "", params: tupl
     }
 
 
+def fetch_cross_venue_summary(conn: sqlite3.Connection, since_clause: str = "", params: tuple = ()) -> dict | None:
+    """Aggregate cross_venue_signals rows. Returns None if the table doesn't
+    exist yet (cross_venue_test.py hasn't been run against this DB)."""
+    try:
+        cur = conn.execute(
+            f"SELECT result, edge_net_pct, edge_gross_pct, window_ms, "
+            f"       match_confidence, market_id_poly, ticker_kalshi "
+            f"FROM cross_venue_signals {since_clause}",
+            params,
+        )
+        rows = cur.fetchall()
+    except sqlite3.OperationalError:
+        return None
+
+    by_result: dict[str, int] = {}
+    edge_pcts: list[float] = []
+    windows_ms: list[float] = []
+    suspicious = 0
+    poly_ids: set[str] = set()
+    kalshi_tickers: set[str] = set()
+
+    for r in rows:
+        result = r["result"] or "?"
+        by_result[result] = by_result.get(result, 0) + 1
+        poly_ids.add(r["market_id_poly"])
+        kalshi_tickers.add(r["ticker_kalshi"])
+        if result == "VIABLE":
+            if r["edge_net_pct"] is not None:
+                edge_pcts.append(float(r["edge_net_pct"]))
+            if r["window_ms"] is not None:
+                windows_ms.append(float(r["window_ms"]))
+            if r["edge_gross_pct"] is not None and float(r["edge_gross_pct"]) > 0.08:
+                suspicious += 1
+
+    return {
+        "total": len(rows),
+        "by_result": by_result,
+        "edge_pcts": edge_pcts,
+        "windows_ms": windows_ms,
+        "suspicious": suspicious,
+        "distinct_poly": len(poly_ids),
+        "distinct_kalshi": len(kalshi_tickers),
+    }
+
+
 def fmt_stats(values: list[float]) -> str:
     if not values:
         return "n/a (0 rows)"
@@ -201,6 +246,11 @@ def render(args: argparse.Namespace) -> str:
         recent = fetch_summary(
             conn, "WHERE recorded_at >= ?", (cutoff,)
         )
+
+        cv_all_time = fetch_cross_venue_summary(conn)
+        cv_recent = fetch_cross_venue_summary(
+            conn, "WHERE ts_ms >= ?", (int((datetime.now(timezone.utc) - timedelta(minutes=args.recent_minutes)).timestamp() * 1000),)
+        )
     finally:
         conn.close()
 
@@ -222,6 +272,28 @@ def render(args: argparse.Namespace) -> str:
     out.append("")
     out.append("[edge_net_pct among non-blocked rows]  " + fmt_stats(all_time["edge_pcts"]))
     out.append("[simulated_pnl among non-blocked rows] " + fmt_stats(all_time["pnls"]))
+
+    out.append("")
+    out.append("=" * 78)
+    out.append(" CROSS-VENUE (Polymarket x other venue: Kalshi/PredictIt) — read-only measurement")
+    out.append("=" * 78)
+    if cv_all_time is None:
+        out.append("  (no cross_venue_signals table yet — run cross_venue_test.py first)")
+    else:
+        out.append(f"[CV all-time]  total rows={cv_all_time['total']}  "
+                    f"distinct poly={cv_all_time['distinct_poly']}  distinct kalshi={cv_all_time['distinct_kalshi']}")
+        out.append("  by result:   " + (", ".join(f"{k}={v}" for k, v in sorted(cv_all_time["by_result"].items(), key=lambda x: -x[1])) or "(none)"))
+        out.append("  edge_net_pct (VIABLE only): " + fmt_stats(cv_all_time["edge_pcts"]))
+        out.append("  window_ms    (VIABLE only): " + fmt_stats(cv_all_time["windows_ms"]))
+        if cv_all_time["suspicious"] > 0:
+            out.append(f"  !! {cv_all_time['suspicious']} VIABLE row(s) with >8% gross edge — "
+                        f"check match_confidence by hand, likely a matcher false-positive, not real arb.")
+
+        out.append("")
+        out.append(f"[CV last {args.recent_minutes} min]  total rows={cv_recent['total'] if cv_recent else 0}")
+        if cv_recent and cv_recent["total"] > 0:
+            out.append("  by result:   " + (", ".join(f"{k}={v}" for k, v in sorted(cv_recent["by_result"].items(), key=lambda x: -x[1])) or "(none)"))
+            out.append("  edge_net_pct (VIABLE only): " + fmt_stats(cv_recent["edge_pcts"]))
 
     out.append("")
     out.append("=" * 78)

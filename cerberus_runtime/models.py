@@ -256,3 +256,53 @@ class CorrelationSignal:
     spread_pct: Decimal
     suggested_action: str
     detected_at_ms: int
+
+
+# ---------------------------------------------------------------------------
+# Cross-venue arbitrage (Polymarket x Kalshi measurement)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class CrossVenueSignal:
+    """A confirmed or rejected cross-venue arbitrage opportunity between a
+    Polymarket market and a matched Kalshi market believed to reference the
+    same real-world event.
+
+    Attributes:
+        market_id_poly:  Polymarket condition_id.
+        ticker_kalshi:   Kalshi market ticker.
+        question:        Human-readable question text used for matching.
+        match_confidence: Fuzzy-match score in [0, 1]; NOT a probability that
+                          the events are identical — a heuristic score meant
+                          to be spot-checked, not trusted blindly.
+        combo:           Which venue/side pairing produced this signal —
+                         "poly_yes_kalshi_no" or "poly_no_kalshi_yes".
+        poly_quote:      Depth-walk result for the Polymarket leg.
+        kalshi_quote:    Depth-walk result for the Kalshi leg.
+        edge_gross:      Raw profit before fees and risk reserve (USDC).
+        fees_total:      Combined fee for both legs (USDC).
+        risk_haircut:    Slippage + legged-risk reserve (USDC).
+        edge_net:        Profit after all deductions (USDC).
+        edge_net_pct:    Net edge as a fraction of total deployed capital.
+        window_ms:       Age (ms) of the staler of the two snapshots at
+                         evaluation time — a wide window means the two books
+                         were not observed close together in time and the
+                         "opportunity" may already be stale on one leg.
+        ts_ms:           Unix timestamp in milliseconds when evaluated.
+    """
+
+    market_id_poly: str
+    ticker_kalshi: str
+    question: str
+    match_confidence: Decimal
+    combo: str
+    poly_quote: LegQuote
+    kalshi_quote: LegQuote
+    edge_gross: Decimal
+    fees_total: Decimal
+    risk_haircut: Decimal
+    edge_net: Decimal
+    edge_net_pct: Decimal
+    window_ms: int
+    ts_ms: int

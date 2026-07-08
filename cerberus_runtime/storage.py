@@ -12,7 +12,13 @@ from typing import List, Optional
 
 import aiosqlite
 
-from cerberus_runtime.models import ArbitrageSignal, FeeParams, Market, ResolutionSignal
+from cerberus_runtime.models import (
+    ArbitrageSignal,
+    CrossVenueSignal,
+    FeeParams,
+    Market,
+    ResolutionSignal,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +80,37 @@ CREATE TABLE IF NOT EXISTS runtime_health (
     value       TEXT NOT NULL,
     updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
+"""
+
+_DDL_CROSS_VENUE = """
+CREATE TABLE IF NOT EXISTS cross_venue_signals (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    market_id_poly   TEXT NOT NULL,
+    ticker_kalshi    TEXT NOT NULL,
+    question         TEXT NOT NULL DEFAULT '',
+    match_confidence REAL NOT NULL DEFAULT 0.0,
+    combo            TEXT NOT NULL DEFAULT '',
+    yes_best_ask     REAL,
+    no_best_ask      REAL,
+    edge_gross       REAL,
+    edge_gross_pct   REAL,
+    fees_total       REAL,
+    edge_net         REAL,
+    edge_net_pct     REAL,
+    window_ms        INTEGER NOT NULL DEFAULT 0,
+    result           TEXT NOT NULL DEFAULT '',
+    rejection_reason TEXT NOT NULL DEFAULT '',
+    ts_ms            INTEGER NOT NULL DEFAULT 0,
+    recorded_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+"""
+
+_INSERT_CROSS_VENUE_SIGNAL = """
+INSERT INTO cross_venue_signals (
+    market_id_poly, ticker_kalshi, question, match_confidence, combo,
+    yes_best_ask, no_best_ask, edge_gross, edge_gross_pct, fees_total,
+    edge_net, edge_net_pct, window_ms, result, rejection_reason, ts_ms
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 _DDL_RESOLUTION = """
@@ -171,6 +208,7 @@ class Storage:
         await self._conn.executescript(_DDL_RESOLUTION)
         await self._conn.executescript(_DDL_RUNTIME_HEALTH)
         await self._conn.executescript(_DDL_CORRELATION)
+        await self._conn.executescript(_DDL_CROSS_VENUE)
         await self._conn.commit()
         # Sprint 5 migrations: add new columns to existing tables if absent.
         await self._migrate_schema()
@@ -436,6 +474,150 @@ class Storage:
             ),
         )
         await self._conn.commit()
+
+    # ------------------------------------------------------------------
+    # cross_venue_signals table (Polymarket x Kalshi measurement)
+    # ------------------------------------------------------------------
+
+    async def insert_cross_venue_signal(
+        self,
+        market_id_poly: str,
+        ticker_kalshi: str,
+        question: str,
+        match_confidence: Decimal,
+        result: str,
+        trade_notional_usdc: Decimal,
+        signal: Optional[CrossVenueSignal] = None,
+        rejection_reason: str = "",
+        rejected_edge: Optional[dict] = None,
+        ts_ms: int = 0,
+    ) -> None:
+        """Insert one cross-venue measurement row.
+
+        Args:
+            result:           "VIABLE" (edge_net > 0, cleared thresholds) or
+                              "FILTERED" (evaluated but rejected/insufficient depth).
+            signal:           The CrossVenueSignal if evaluation produced one.
+            rejected_edge:    When signal is None, the numeric edge dict
+                              evaluate_cross_venue_opportunity had already
+                              computed via its ``_reason`` out-param before
+                              rejecting — same pattern as
+                              insert_paper_signal_from_snapshot's rejected_edge.
+        """
+        assert self._conn, "Call connect() before insert_cross_venue_signal()"
+
+        if signal is not None:
+            yes_best = float(signal.poly_quote.avg_price)
+            no_best = float(signal.kalshi_quote.avg_price)
+            edge_gross = float(signal.edge_gross)
+            fees_total = float(signal.fees_total)
+            edge_net = float(signal.edge_net)
+            edge_net_pct = float(signal.edge_net_pct)
+            combo = signal.combo
+            window_ms = signal.window_ms
+        elif rejected_edge:
+            yes_best = float(rejected_edge["poly_best_ask"]) if "poly_best_ask" in rejected_edge else None
+            no_best = float(rejected_edge["kalshi_best_ask"]) if "kalshi_best_ask" in rejected_edge else None
+            edge_gross = float(rejected_edge["edge_gross"]) if "edge_gross" in rejected_edge else None
+            fees_total = float(rejected_edge["fees_total"]) if "fees_total" in rejected_edge else None
+            edge_net = float(rejected_edge["edge_net"]) if "edge_net" in rejected_edge else None
+            edge_net_pct = float(rejected_edge["edge_net_pct"]) if "edge_net_pct" in rejected_edge else None
+            combo = rejected_edge.get("combo", "")
+            window_ms = rejected_edge.get("window_ms", 0)
+        else:
+            yes_best = no_best = edge_gross = fees_total = edge_net = edge_net_pct = None
+            combo = ""
+            window_ms = 0
+
+        edge_gross_pct = (
+            edge_gross / (2.0 * float(trade_notional_usdc))
+            if edge_gross is not None and trade_notional_usdc
+            else None
+        )
+
+        await self._conn.execute(
+            _INSERT_CROSS_VENUE_SIGNAL,
+            (
+                market_id_poly,
+                ticker_kalshi,
+                question,
+                float(match_confidence),
+                combo,
+                yes_best,
+                no_best,
+                edge_gross,
+                edge_gross_pct,
+                fees_total,
+                edge_net,
+                edge_net_pct,
+                window_ms,
+                result,
+                rejection_reason,
+                ts_ms,
+            ),
+        )
+        await self._conn.commit()
+
+    async def get_cross_venue_summary(self, since_ts_ms: int = 0) -> dict:
+        """Return aggregated cross-venue measurement statistics since *since_ts_ms*.
+
+        Returns:
+            dict with keys:
+              total_evaluated       int
+              viable_signals        int   — result == "VIABLE"
+              distinct_poly_markets int
+              distinct_kalshi_tickers int
+              median_edge_net_pct   Decimal — median over VIABLE rows
+              median_window_ms      Decimal — median over VIABLE rows
+              suspicious_high_edge  int   — VIABLE rows with edge_gross_pct > 8%
+                                            (likely matcher bug, not real arb)
+        """
+        assert self._conn, "Call connect() before get_cross_venue_summary()"
+
+        async with self._conn.execute(
+            "SELECT market_id_poly, ticker_kalshi, result, edge_net_pct, "
+            "       edge_gross_pct, window_ms "
+            "FROM cross_venue_signals WHERE ts_ms >= ?",
+            (since_ts_ms,),
+        ) as cur:
+            rows = await cur.fetchall()
+
+        total = len(rows)
+        viable = 0
+        poly_ids: set = set()
+        kalshi_tickers: set = set()
+        edge_pcts: list[float] = []
+        window_mss: list[float] = []
+        suspicious = 0
+
+        for row in rows:
+            poly_ids.add(row["market_id_poly"])
+            kalshi_tickers.add(row["ticker_kalshi"])
+            if row["result"] == "VIABLE":
+                viable += 1
+                if row["edge_net_pct"] is not None:
+                    edge_pcts.append(float(row["edge_net_pct"]))
+                if row["window_ms"] is not None:
+                    window_mss.append(float(row["window_ms"]))
+                if row["edge_gross_pct"] is not None and float(row["edge_gross_pct"]) > 0.08:
+                    suspicious += 1
+
+        median_edge = Decimal("0")
+        if edge_pcts:
+            median_edge = Decimal(str(statistics.median(edge_pcts)))
+        median_window = Decimal("0")
+        if window_mss:
+            median_window = Decimal(str(statistics.median(window_mss)))
+
+        return {
+            "total_evaluated": total,
+            "viable_signals": viable,
+            "distinct_poly_markets": len(poly_ids),
+            "distinct_kalshi_tickers": len(kalshi_tickers),
+            "median_edge_net_pct": median_edge,
+            "median_window_ms": median_window,
+            "suspicious_high_edge": suspicious,
+        }
 
     async def get_paper_summary(self, since_ts_ms: int = 0) -> dict:
         """Return aggregated paper-trading statistics since *since_ts_ms*.
